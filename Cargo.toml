@@ -1,0 +1,31 @@
+[package]
+name = "wgpu-info-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Portable wgpu GPU capability reporting (limits, features, downlevel, formats) with a diagnostic CLI"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "wgpu_info"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wgpu-info"
+path = "src/bin/wgpu-info.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+# CLI binary deps. The library itself never needs clap.
+cli = ["dep:clap"]
+
+[dependencies]
+# Pinned to match the workspace wgpu in gitnexus-rs / vfx-rs (avoids a second wgpu+naga copy).
+# `serde` lets us serialize wgpu's own Limits/AdapterInfo straight into the report.
+wgpu = { version = "29", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# wgpu adapter enumeration / device creation are async; we block on them so the
+# public query API stays synchronous and ergonomic for non-async callers.
+pollster = "0.4"
+clap = { version = "4", features = ["derive"], optional = true }
