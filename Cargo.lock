@@ -362,6 +362,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpu-mem"
+version = "0.1.0"
+source = "git+ssh://git@github.com/ssoj13/gpu-mem.git?branch=main#a8bc5dd13fce6264a349cdf79704f994ab433c01"
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1159,9 +1164,9 @@ dependencies = [
 
 [[package]]
 name = "wgpu-hal"
-version = "29.0.3"
+version = "29.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31f8e1a9e7a8512f276f7c62e018c7fa8d60954303fed2e5750114332049193f"
+checksum = "dac78792c16e0fe6ba2521174f166fa4d105571ca2966cf04657eb78e0836b8f"
 dependencies = [
  "android_system_properties",
  "arrayvec",
@@ -1217,6 +1222,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "clap",
+ "gpu-mem",
  "log",
  "objc2",
  "objc2-metal",

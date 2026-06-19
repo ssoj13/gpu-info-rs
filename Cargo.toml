@@ -20,6 +20,8 @@ default = ["cli"]
 cli = ["dep:clap"]
 
 [dependencies]
+# OS-level VRAM/RAM (no GPU context) - re-exported as `wgpu_info::gpu_mem`.
+gpu-mem = { git = "ssh://git@github.com/ssoj13/gpu-mem.git", branch = "main" }
 # Pinned to match the workspace wgpu in gitnexus-rs / vfx-rs (avoids a second wgpu+naga copy).
 # `serde` lets us serialize wgpu's own Limits/AdapterInfo straight into the report.
 wgpu = { version = "29", features = ["serde"] }

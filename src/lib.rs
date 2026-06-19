@@ -35,6 +35,11 @@ mod vram;
 
 pub use model::{AdapterReport, DownlevelReport, GpuReport, TextureFormatReport};
 pub use vram::{GpuVramContext, VramInfo, VramQuerier, vram_budget_bytes, vram_budget_from_context};
+
+/// OS-level VRAM + system RAM query that needs no GPU context (subprocess-based,
+/// zero-dependency). Complements the DXGI adapter budget in [`vram`]; re-exported
+/// from the `gpu-mem` crate so wgpu-info is the single place for GPU-memory info.
+pub use gpu_mem;
 /// Re-exported so consumers spell `wgpu` types from a single, version-matched source.
 pub use wgpu;
 
