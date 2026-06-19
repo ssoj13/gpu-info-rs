@@ -8,7 +8,7 @@
 //! ## Quick start
 //!
 //! ```no_run
-//! let report = wgpu_info::query();
+//! let report = gpu_info::query();
 //! for adapter in &report.adapters {
 //!     println!(
 //!         "{} ({}): max_storage_buffers_per_shader_stage = {}",
@@ -25,7 +25,7 @@
 //! ```no_run
 //! # async fn demo(adapter: &wgpu::Adapter) -> Result<(), wgpu::RequestDeviceError> {
 //! // Before: required_limits: wgpu::Limits::default()   // caps at 8 storage buffers
-//! let (device, queue) = wgpu_info::request_max_device(adapter, wgpu::Features::empty()).await?;
+//! let (device, queue) = gpu_info::request_max_device(adapter, wgpu::Features::empty()).await?;
 //! # let _ = (device, queue); Ok(())
 //! # }
 //! ```
@@ -33,13 +33,14 @@
 mod model;
 mod vram;
 
+/// OS-level VRAM + system RAM query without a GPU context (subprocess-based,
+/// zero `unsafe`, no wgpu): `nvidia-smi` / `reg query` / sysfs / `system_profiler`.
+/// Complements the wgpu capability report and the DXGI [`vram`] adapter budget.
+pub mod os;
+
 pub use model::{AdapterReport, DownlevelReport, GpuReport, TextureFormatReport};
 pub use vram::{GpuVramContext, VramInfo, VramQuerier, vram_budget_bytes, vram_budget_from_context};
 
-/// OS-level VRAM + system RAM query that needs no GPU context (subprocess-based,
-/// zero-dependency). Complements the DXGI adapter budget in [`vram`]; re-exported
-/// from the `gpu-mem` crate so wgpu-info is the single place for GPU-memory info.
-pub use gpu_mem;
 /// Re-exported so consumers spell `wgpu` types from a single, version-matched source.
 pub use wgpu;
 

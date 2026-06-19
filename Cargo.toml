@@ -1,16 +1,16 @@
 [package]
-name = "wgpu-info-rs"
+name = "gpu-info-rs"
 version = "0.1.0"
 edition = "2024"
-description = "Portable wgpu GPU capability reporting (limits, features, downlevel, formats) with a diagnostic CLI"
+description = "Portable GPU info: wgpu capability reporting (limits/features/formats) + DXGI VRAM budget, plus OS-level VRAM/RAM query (no GPU context). One-stop GPU info crate with a diagnostic CLI."
 license = "MIT OR Apache-2.0"
 
 [lib]
-name = "wgpu_info"
+name = "gpu_info"
 path = "src/lib.rs"
 
 [[bin]]
-name = "wgpu-info"
+name = "gpu-info"
 path = "src/bin/wgpu-info.rs"
 required-features = ["cli"]
 
@@ -21,7 +21,6 @@ cli = ["dep:clap"]
 
 [dependencies]
 # OS-level VRAM/RAM (no GPU context) - re-exported as `wgpu_info::gpu_mem`.
-gpu-mem = { git = "ssh://git@github.com/ssoj13/gpu-mem.git", branch = "main" }
 # Pinned to match the workspace wgpu in gitnexus-rs / vfx-rs (avoids a second wgpu+naga copy).
 # `serde` lets us serialize wgpu's own Limits/AdapterInfo straight into the report.
 wgpu = { version = "29", features = ["serde"] }

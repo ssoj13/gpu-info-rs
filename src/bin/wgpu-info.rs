@@ -3,7 +3,7 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use wgpu_info::{GpuReport, wgpu};
+use gpu_info::{GpuReport, wgpu};
 
 #[derive(Parser)]
 #[command(name = "wgpu-info", version, about = "Report GPU capabilities via wgpu")]
@@ -41,7 +41,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let args = Args::parse();
     let backends = parse_backends(&args.backend)?;
 
-    let mut report = wgpu_info::query_backends(backends);
+    let mut report = gpu_info::query_backends(backends);
 
     if let Some(idx) = args.adapter {
         if idx >= report.adapters.len() {

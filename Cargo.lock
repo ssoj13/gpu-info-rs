@@ -362,9 +362,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "gpu-mem"
+name = "gpu-info-rs"
 version = "0.1.0"
-source = "git+ssh://git@github.com/ssoj13/gpu-mem.git?branch=main#a8bc5dd13fce6264a349cdf79704f994ab433c01"
+dependencies = [
+ "ash",
+ "clap",
+ "log",
+ "objc2",
+ "objc2-metal",
+ "pollster",
+ "serde",
+ "serde_json",
+ "wgpu",
+ "windows",
+]
 
 [[package]]
 name = "half"
@@ -1214,23 +1225,6 @@ dependencies = [
  "windows",
  "windows-core",
  "windows-result",
-]
-
-[[package]]
-name = "wgpu-info-rs"
-version = "0.1.0"
-dependencies = [
- "ash",
- "clap",
- "gpu-mem",
- "log",
- "objc2",
- "objc2-metal",
- "pollster",
- "serde",
- "serde_json",
- "wgpu",
- "windows",
 ]
 
 [[package]]
