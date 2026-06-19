@@ -31,8 +31,10 @@
 //! ```
 
 mod model;
+mod vram;
 
 pub use model::{AdapterReport, DownlevelReport, GpuReport, TextureFormatReport};
+pub use vram::{GpuVramContext, VramInfo, VramQuerier, vram_budget_bytes, vram_budget_from_context};
 /// Re-exported so consumers spell `wgpu` types from a single, version-matched source.
 pub use wgpu;
 
@@ -71,6 +73,51 @@ pub fn query_backends(backends: wgpu::Backends) -> GpuReport {
 #[must_use]
 pub fn recommended_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
     adapter.limits()
+}
+
+/// A compact, multi-line summary of a chosen adapter for startup logging.
+#[must_use]
+pub fn adapter_summary(adapter: &wgpu::Adapter) -> String {
+    use core::fmt::Write as _;
+    let r = AdapterReport::from_adapter(adapter);
+    let l = &r.limits;
+    let vendor = r
+        .vendor_name
+        .as_deref()
+        .map(|v| format!("{v} (0x{:04x})", r.vendor & 0xffff))
+        .unwrap_or_else(|| format!("0x{:04x}", r.vendor & 0xffff));
+    let mut s = String::new();
+    let _ = writeln!(s, "GPU: {}  [{}, {}]", r.name, r.backend, r.device_type);
+    let _ = writeln!(s, "  vendor   : {vendor}   device 0x{:04x}", r.device & 0xffff);
+    if !r.driver.is_empty() || !r.driver_info.is_empty() {
+        let _ = writeln!(s, "  driver   : {} {}", r.driver, r.driver_info);
+    }
+    let _ = writeln!(
+        s,
+        "  shader   : model={}  webgpu_compliant={}  subgroup={}..{}",
+        r.downlevel.shader_model, r.downlevel.is_webgpu_compliant, r.subgroup_min_size,
+        r.subgroup_max_size
+    );
+    let _ = writeln!(
+        s,
+        "  buffers  : storage/stage={}  uniform/stage={}  max_storage_binding={}  max_buffer={}",
+        l.max_storage_buffers_per_shader_stage, l.max_uniform_buffers_per_shader_stage,
+        l.max_storage_buffer_binding_size, l.max_buffer_size
+    );
+    let _ = writeln!(
+        s,
+        "  compute  : invocations/wg={}  wg_size=[{}, {}, {}]  wg/dim={}",
+        l.max_compute_invocations_per_workgroup, l.max_compute_workgroup_size_x,
+        l.max_compute_workgroup_size_y, l.max_compute_workgroup_size_z,
+        l.max_compute_workgroups_per_dimension
+    );
+    let _ = write!(
+        s,
+        "  binding  : bind_groups={}  sampled_textures/stage={}  samplers/stage={}",
+        l.max_bind_groups, l.max_sampled_textures_per_shader_stage,
+        l.max_samplers_per_shader_stage
+    );
+    s
 }
 
 /// Request a device with the adapter's **maximum** limits, plus any extra features.
@@ -178,5 +225,23 @@ mod tests {
         assert_eq!(diff.len(), 1);
         assert!(diff[0].contains("maxStorageBuffersPerShaderStage"));
         assert!(diff[0].contains("8 -> 64"));
+    }
+
+    /// Calls `vram_budget_bytes` against live adapters; no panic.
+    #[test]
+    #[ignore = "requires a GPU"]
+    fn live_vram_budget_no_panic() {
+        let report = query();
+        if report.adapters.is_empty() {
+            return;
+        }
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = wgpu::Backends::all();
+        let instance = wgpu::Instance::new(desc);
+        let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+        for adapter in &adapters {
+            let budget = vram_budget_bytes(adapter);
+            println!("{}: vram_budget_bytes = {:?}", adapter.get_info().name, budget);
+        }
     }
 }

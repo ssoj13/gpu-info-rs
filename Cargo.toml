@@ -29,3 +29,26 @@ serde_json = "1"
 # public query API stays synchronous and ergonomic for non-async callers.
 pollster = "0.4"
 clap = { version = "4", features = ["derive"], optional = true }
+log = "0.4"
+
+# ---------------------------------------------------------------------------
+# Live-VRAM platform backends (see `src/vram.rs`). Each is declared ONLY under
+# its own target so a non-Windows crate never pulls the `windows` crate, etc.
+# ---------------------------------------------------------------------------
+
+# Windows: DXGI used/budget query (the VERIFIED path). Backend-agnostic.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Foundation",
+] }
+
+# Linux: Vulkan VK_EXT_memory_budget via `Adapter::as_hal` (WRITTEN, UNVERIFIED).
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+ash = { version = "0.38", default-features = false, features = ["std", "loaded"] }
+
+# macOS: Metal MTLDevice via wgpu Device::as_hal (objc2, same types as wgpu-hal 29).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-metal = { version = "0.3.2", features = ["MTLDevice"] }

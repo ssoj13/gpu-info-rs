@@ -172,6 +172,30 @@ impl AdapterReport {
 }
 
 impl GpuReport {
+    /// Plain `(name, backend)` strings for the report's primary adapter.
+    ///
+    /// Why: UI consumers (e.g. the viewer status bar) want a one-line GPU
+    /// label without spelling any `wgpu` types — keeping the wgpu-version
+    /// boundary clean (this crate may compile against a different wgpu patch
+    /// than the host). Returns owned `String`s copied out of [`AdapterReport`].
+    ///
+    /// Selection: a discrete GPU is preferred over integrated/CPU/other when
+    /// several adapters are enumerated (the same physical GPU often appears
+    /// once per backend); falls back to the first adapter, and to
+    /// `("unknown", "none")` when no adapter was found.
+    #[must_use]
+    pub fn primary_summary(&self) -> (String, String) {
+        let pick = self
+            .adapters
+            .iter()
+            .find(|a| a.device_type == "DiscreteGpu")
+            .or_else(|| self.adapters.first());
+        match pick {
+            Some(a) => (a.name.clone(), a.backend.clone()),
+            None => ("unknown".to_string(), "none".to_string()),
+        }
+    }
+
     /// Compare two reports and return a list of human-readable differences
     /// (`path: old -> new`). Empty when the reports are identical.
     ///
