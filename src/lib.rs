@@ -81,6 +81,19 @@ pub fn recommended_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
     adapter.limits()
 }
 
+/// Supported MSAA sample counts for `format` on this adapter (always includes `1`), e.g. `[1, 4]`.
+///
+/// Cross-platform: the answer comes straight from `wgpu`'s backend-reported
+/// [`wgpu::TextureFormatFeatureFlags`], so it is accurate on Metal / Vulkan / DX12 / GL alike
+/// (no platform-specific code, no hard-coded `4`). Renderers should intersect the result across
+/// EVERY attachment format a pass uses — e.g. the color target AND the depth format — because a
+/// GPU may support more MSAA counts for color than for depth; committing to a level only one
+/// side supports panics at texture creation.
+#[must_use]
+pub fn supported_sample_counts(adapter: &wgpu::Adapter, format: wgpu::TextureFormat) -> Vec<u32> {
+    model::sample_counts_from_flags(adapter.get_texture_format_features(format).flags)
+}
+
 /// A compact, multi-line summary of a chosen adapter for startup logging.
 #[must_use]
 pub fn adapter_summary(adapter: &wgpu::Adapter) -> String {
@@ -189,6 +202,17 @@ mod tests {
                 texture_formats: vec![],
             }],
         }
+    }
+
+    /// MSAA flag -> concrete counts mapping is GPU-free (synthetic flags), so it runs anywhere.
+    #[test]
+    fn sample_counts_from_flags_maps_msaa() {
+        use wgpu::TextureFormatFeatureFlags as F;
+        // No MSAA flags -> only single-sampled.
+        assert_eq!(crate::model::sample_counts_from_flags(F::empty()), vec![1]);
+        // 2x + 4x present, 8x/16x absent.
+        let counts = crate::model::sample_counts_from_flags(F::MULTISAMPLE_X2 | F::MULTISAMPLE_X4);
+        assert_eq!(counts, vec![1, 2, 4]);
     }
 
     #[test]

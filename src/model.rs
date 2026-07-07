@@ -78,6 +78,26 @@ pub struct TextureFormatReport {
     pub allowed_usages: Vec<String>,
     /// Additional [`wgpu::TextureFormatFeatureFlags`], as flag names.
     pub flags: Vec<String>,
+    /// Supported MSAA sample counts for this format (always includes `1`), e.g. `[1, 4]`.
+    ///
+    /// Structured companion to the `MULTISAMPLE_X*` entries in [`Self::flags`]: lets callers
+    /// pick a valid `sample_count` (or intersect across attachments) without string-parsing
+    /// or hard-coding `4`. See [`crate::supported_sample_counts`] for a direct per-format query.
+    pub sample_counts: Vec<u32>,
+}
+
+/// Standard MSAA sample counts a texture may support, probed in ascending order.
+const MSAA_SAMPLE_COUNTS: [u32; 5] = [1, 2, 4, 8, 16];
+
+/// Structured MSAA support from a format's feature flags (always includes `1`).
+///
+/// Reads [`wgpu::TextureFormatFeatureFlags::sample_count_supported`] for each standard MSAA
+/// count so callers get `[1, 4]` instead of matching `"MULTISAMPLE_X4"` strings.
+pub(crate) fn sample_counts_from_flags(flags: wgpu::TextureFormatFeatureFlags) -> Vec<u32> {
+    MSAA_SAMPLE_COUNTS
+        .into_iter()
+        .filter(|&n| n == 1 || flags.sample_count_supported(n))
+        .collect()
 }
 
 /// Texture formats probed by default — the common render/compute/depth/compressed set.
@@ -143,6 +163,7 @@ impl AdapterReport {
                     format: format!("{format:?}"),
                     allowed_usages: tf.allowed_usages.iter_names().map(|(n, _)| n.to_string()).collect(),
                     flags: tf.flags.iter_names().map(|(n, _)| n.to_string()).collect(),
+                    sample_counts: sample_counts_from_flags(tf.flags),
                 }
             })
             .collect();
@@ -299,6 +320,20 @@ impl GpuReport {
             } else {
                 for f in &a.features {
                     let _ = writeln!(s, "        {f}");
+                }
+            }
+
+            // MSAA support per format (only formats that allow >1 sample — hides the noise of
+            // every 1x-only format). This is the capability that decides a renderer's MSAA level.
+            let msaa: Vec<&TextureFormatReport> = a
+                .texture_formats
+                .iter()
+                .filter(|f| f.sample_counts.len() > 1)
+                .collect();
+            if !msaa.is_empty() {
+                let _ = writeln!(s, "    msaa (sample counts):");
+                for f in msaa {
+                    let _ = writeln!(s, "        {:<24} {:?}", f.format, f.sample_counts);
                 }
             }
         }

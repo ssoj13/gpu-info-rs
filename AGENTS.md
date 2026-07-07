@@ -197,6 +197,11 @@ pub fn wgpu_info::query_backends(backends: wgpu::Backends) -> GpuReport;
 // --- Device helpers (need the host's &wgpu::Adapter; versions must match) ---
 pub fn wgpu_info::recommended_limits(adapter: &wgpu::Adapter) -> wgpu::Limits;
 
+// Supported MSAA sample counts for a format (always includes 1), e.g. [1, 4]. Cross-platform
+// (Metal/Vulkan/DX12/GL) via wgpu's format-feature flags. Intersect across every attachment a
+// pass uses (color AND depth) before choosing a level.
+pub fn wgpu_info::supported_sample_counts(adapter: &wgpu::Adapter, format: wgpu::TextureFormat) -> Vec<u32>;
+
 pub async fn wgpu_info::request_max_device(
     adapter: &wgpu::Adapter,
     extra_features: wgpu::Features,        // intersected with adapter support
@@ -247,6 +252,7 @@ pub struct TextureFormatReport {
     pub format: String,
     pub allowed_usages: Vec<String>,
     pub flags: Vec<String>,
+    pub sample_counts: Vec<u32>,      // supported MSAA counts (incl. 1), e.g. [1, 4]
 }
 ```
 
