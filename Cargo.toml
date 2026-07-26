@@ -31,6 +31,11 @@ serde_json = "1"
 pollster = "0.4"
 clap = { version = "4", features = ["derive"], optional = true }
 log = "0.4"
+# GpuImage host<->GPU boundary: Rgba16Float stores half-floats, so the f32 host API converts via
+# `half::f16`; `bytemuck` reinterprets the packed halves as bytes for `write_texture` / readback.
+half = { version = "2", features = ["bytemuck"] }
+bytemuck = "1"
+thiserror = "2"
 
 # ---------------------------------------------------------------------------
 # Live-VRAM platform backends (see `src/vram.rs`). Each is declared ONLY under

@@ -30,6 +30,9 @@
 //! # }
 //! ```
 
+/// Canonical GPU media-image handle ([`GpuImage`]) shared by every cluster GPU consumer.
+/// Lives here because this crate anchors wgpu and owns [`shared_device`] (cycle-free).
+pub mod image;
 mod model;
 mod vram;
 
@@ -38,6 +41,7 @@ mod vram;
 /// Complements the wgpu capability report and the DXGI [`vram`] adapter budget.
 pub mod os;
 
+pub use image::{GpuImage, GpuImageError};
 pub use model::{AdapterReport, DownlevelReport, GpuReport, TextureFormatReport};
 pub use vram::{GpuVramContext, VramInfo, VramQuerier, vram_budget_bytes, vram_budget_from_context};
 
