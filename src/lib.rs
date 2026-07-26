@@ -141,9 +141,13 @@ pub fn adapter_summary(adapter: &wgpu::Adapter) -> String {
 
 /// Request a device with the adapter's **maximum** limits, plus any extra features.
 ///
-/// `extra_features` is intersected with what the adapter supports, so passing
-/// [`wgpu::Features::all`] is safe (you get every supported feature). The returned device's
-/// limits equal `adapter.limits()`, eliminating the `Limits::default()` guessing game.
+/// `extra_features` is intersected with what the adapter supports. NOTE (wgpu 30): do NOT pass
+/// [`wgpu::Features::all`] — the adapter reports EXPERIMENTAL features (ray-query, mesh-shader,
+/// cooperative-matrix, …) that `request_device` REJECTS unless you flip `unsafe`
+/// `ExperimentalFeatures::enabled()`. Request every *stable* feature with
+/// `wgpu::Features::all() & !wgpu::Features::all_experimental_mask()` instead (this is what
+/// [`shared_device`] does). The returned device's limits equal `adapter.limits()`, eliminating the
+/// `Limits::default()` guessing game.
 pub async fn request_max_device(
     adapter: &wgpu::Adapter,
     extra_features: wgpu::Features,
