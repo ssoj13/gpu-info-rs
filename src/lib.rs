@@ -166,9 +166,80 @@ pub fn request_max_device_blocking(
     pollster::block_on(request_max_device(adapter, extra_features))
 }
 
-/// Major wgpu version this crate targets. Pinned to the `wgpu = "29"` dependency in
-/// `Cargo.toml`; semver keeps the major at 29 for every 29.x patch.
-const WGPU_VERSION: &str = "29";
+/// The process-wide shared GPU context: ONE negotiation, ONE physical device.
+///
+/// `wgpu`'s [`Device`](wgpu::Device), [`Queue`](wgpu::Queue) and [`Adapter`](wgpu::Adapter) are
+/// cheap `Arc`-backed handles, so a consumer `.clone()`s these fields into its own device-adoption
+/// entry point (e.g. jph-wgpu's `Gpu::from_parts`, exv-gpu's `from_wgpu`) and every consumer then
+/// shares ONE physical device. That is what makes zero-copy interop possible: decoded frames and
+/// compute results all live on the same device instead of being split across independently
+/// negotiated ones.
+pub struct SharedGpu {
+    /// The shared logical device (max limits + every supported feature). Clone to adopt.
+    pub device: wgpu::Device,
+    /// The queue paired with [`device`](Self::device). Clone to adopt.
+    pub queue: wgpu::Queue,
+    /// The adapter the device was created from. Clone to adopt (some adopters want the adapter).
+    pub adapter: wgpu::Adapter,
+}
+
+/// Cached result of THE single process-wide device negotiation. `None` = the negotiation ran and
+/// no adapter/device was available — a cached negative, so a GPU-less machine does not re-probe
+/// on every call.
+static SHARED: std::sync::OnceLock<Option<SharedGpu>> = std::sync::OnceLock::new();
+
+/// Borrow the process-wide shared GPU context, negotiating it EXACTLY ONCE.
+///
+/// This is THE single `Instance` / `request_adapter` / `request_device` negotiation for the whole
+/// process. Every GPU consumer in the cluster should ADOPT this context — cloning the handles into
+/// its own `from_parts` / `from_wgpu` adopter — rather than creating its own [`wgpu::Instance`].
+/// Independent negotiations were the historical cause of test-suite hangs and split decoded/compute
+/// results across two physical devices.
+///
+/// The device is built with the adapter's MAXIMUM limits and every supported *stable* feature
+/// ([`wgpu::Features::all`] minus [`wgpu::Features::all_experimental_mask`], intersected with the
+/// adapter's real feature set), so an adopter that needs e.g. `TIMESTAMP_QUERY` or
+/// `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` for its fast path finds them present, while an
+/// adopter that doesn't simply ignores them. Experimental features (ray-query, mesh-shader,
+/// cooperative-matrix …) are excluded on purpose: wgpu 30 rejects them at `request_device` unless
+/// the caller flips an `unsafe { ExperimentalFeatures::enabled() }` opt-in, and requesting them
+/// would make the whole negotiation fail with "experimental features are not enabled".
+///
+/// Returns `None` (cached) when no adapter is available or device creation fails — never panics.
+/// [`OnceLock::get_or_init`] collapses concurrent first callers into ONE negotiation.
+pub fn shared_device() -> Option<&'static SharedGpu> {
+    SHARED
+        .get_or_init(|| {
+            let instance =
+                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            // HighPerformance + no fallback: adopt the real discrete GPU, not a software rasterizer.
+            let adapter = pollster::block_on(instance.request_adapter(
+                &wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                    apply_limit_buckets: false, // wgpu 30
+                },
+            ))
+            .ok()?;
+            // Every stable feature, minus experimental ones (which need an unsafe instance opt-in),
+            // so ANY adopter's fast path is satisfied on the one shared device without the whole
+            // negotiation failing. `request_max_device` intersects this with `adapter.features()`.
+            let stable_features = wgpu::Features::all() & !wgpu::Features::all_experimental_mask();
+            let (device, queue) =
+                pollster::block_on(request_max_device(&adapter, stable_features)).ok()?;
+            Some(SharedGpu {
+                device,
+                queue,
+                adapter,
+            })
+        })
+        .as_ref()
+}
+
+/// Major wgpu version this crate targets. Pinned to the `wgpu = "30"` dependency in
+/// `Cargo.toml`; semver keeps the major at 30 for every 30.x patch.
+const WGPU_VERSION: &str = "30";
 
 #[cfg(test)]
 mod tests {
@@ -244,6 +315,37 @@ mod tests {
                 .any(|a| a.limits.max_storage_buffers_per_shader_stage >= 8),
             "expected at least one adapter at or above the baseline storage-buffer limit"
         );
+    }
+
+    /// Pins the single-negotiation guarantee: two calls return the SAME `&SharedGpu`.
+    /// Requires a real GPU adapter; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore = "requires a GPU"]
+    fn shared_device_is_singleton() {
+        let a = shared_device().expect("no shared GPU device available on this system");
+        let b = shared_device().expect("shared device vanished on the second call");
+        assert!(
+            std::ptr::eq(a, b),
+            "shared_device() returned two distinct contexts — negotiation ran more than once"
+        );
+    }
+
+    /// GPU-free OnceLock idempotency: repeated calls yield the same cached state (both `Some`
+    /// or both `None`) and a pointer-stable `&'static`. Safe even without a GPU (returns `None`).
+    #[test]
+    fn shared_device_is_idempotent() {
+        let first = shared_device();
+        let second = shared_device();
+        assert_eq!(
+            first.is_some(),
+            second.is_some(),
+            "shared_device() Option-state changed between calls"
+        );
+        match (first, second) {
+            (Some(a), Some(b)) => assert!(std::ptr::eq(a, b), "cached context is not pointer-stable"),
+            (None, None) => {}
+            _ => unreachable!("is_some() equality already asserted above"),
+        }
     }
 
     #[test]
