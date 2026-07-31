@@ -205,6 +205,14 @@ pub struct SharedGpu {
     pub queue: wgpu::Queue,
     /// The adapter the device was created from. Clone to adopt (some adopters want the adapter).
     pub adapter: wgpu::Adapter,
+    /// The instance the adapter came from. Clone to adopt.
+    ///
+    /// Needed by GUI adopters: `egui_wgpu::WgpuSetupExisting` wants all four handles, and a
+    /// surface must be created from the SAME instance the adapter belongs to. Without this field
+    /// an egui/eframe host had to negotiate its own instance+adapter+device, which put the UI on a
+    /// different physical device than every compute consumer adopting this one — exactly the split
+    /// this module exists to prevent.
+    pub instance: wgpu::Instance,
 }
 
 /// Cached result of THE single process-wide device negotiation. `None` = the negotiation ran and
@@ -255,6 +263,7 @@ pub fn shared_device() -> Option<&'static SharedGpu> {
                 device,
                 queue,
                 adapter,
+                instance,
             })
         })
         .as_ref()
