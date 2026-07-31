@@ -35,15 +35,22 @@
 pub mod image;
 mod model;
 mod vram;
+/// Windows RAM via `GlobalMemoryStatusEx` (a syscall, not a `wmic` process spawn) — see [`win_mem`].
+#[cfg(windows)]
+mod win_mem;
 
-/// OS-level VRAM + system RAM query without a GPU context (subprocess-based,
-/// zero `unsafe`, no wgpu): `nvidia-smi` / `reg query` / sysfs / `system_profiler`.
+/// OS-level VRAM + system RAM query without a GPU context, no wgpu: `nvidia-smi` / `reg query` /
+/// sysfs / `system_profiler`. `os` itself stays `#![forbid(unsafe_code)]`; the ONE exception is
+/// Windows RAM, which uses the `GlobalMemoryStatusEx` SYSCALL (isolated in [`win_mem`]) instead of a
+/// `wmic` process spawn — that spawn hitched a consumer's UI thread on every poll.
 /// Complements the wgpu capability report and the DXGI [`vram`] adapter budget.
 pub mod os;
 
 pub use image::{GpuImage, GpuImageError};
 pub use model::{AdapterReport, DownlevelReport, GpuReport, TextureFormatReport};
-pub use vram::{GpuVramContext, VramInfo, VramQuerier, vram_budget_bytes, vram_budget_from_context};
+pub use vram::{
+    GpuVramContext, VramInfo, VramQuerier, vram_budget_bytes, vram_budget_from_context,
+};
 
 /// Re-exported so consumers spell `wgpu` types from a single, version-matched source.
 pub use wgpu;
@@ -111,34 +118,43 @@ pub fn adapter_summary(adapter: &wgpu::Adapter) -> String {
         .unwrap_or_else(|| format!("0x{:04x}", r.vendor & 0xffff));
     let mut s = String::new();
     let _ = writeln!(s, "GPU: {}  [{}, {}]", r.name, r.backend, r.device_type);
-    let _ = writeln!(s, "  vendor   : {vendor}   device 0x{:04x}", r.device & 0xffff);
+    let _ = writeln!(
+        s,
+        "  vendor   : {vendor}   device 0x{:04x}",
+        r.device & 0xffff
+    );
     if !r.driver.is_empty() || !r.driver_info.is_empty() {
         let _ = writeln!(s, "  driver   : {} {}", r.driver, r.driver_info);
     }
     let _ = writeln!(
         s,
         "  shader   : model={}  webgpu_compliant={}  subgroup={}..{}",
-        r.downlevel.shader_model, r.downlevel.is_webgpu_compliant, r.subgroup_min_size,
+        r.downlevel.shader_model,
+        r.downlevel.is_webgpu_compliant,
+        r.subgroup_min_size,
         r.subgroup_max_size
     );
     let _ = writeln!(
         s,
         "  buffers  : storage/stage={}  uniform/stage={}  max_storage_binding={}  max_buffer={}",
-        l.max_storage_buffers_per_shader_stage, l.max_uniform_buffers_per_shader_stage,
-        l.max_storage_buffer_binding_size, l.max_buffer_size
+        l.max_storage_buffers_per_shader_stage,
+        l.max_uniform_buffers_per_shader_stage,
+        l.max_storage_buffer_binding_size,
+        l.max_buffer_size
     );
     let _ = writeln!(
         s,
         "  compute  : invocations/wg={}  wg_size=[{}, {}, {}]  wg/dim={}",
-        l.max_compute_invocations_per_workgroup, l.max_compute_workgroup_size_x,
-        l.max_compute_workgroup_size_y, l.max_compute_workgroup_size_z,
+        l.max_compute_invocations_per_workgroup,
+        l.max_compute_workgroup_size_x,
+        l.max_compute_workgroup_size_y,
+        l.max_compute_workgroup_size_z,
         l.max_compute_workgroups_per_dimension
     );
     let _ = write!(
         s,
         "  binding  : bind_groups={}  sampled_textures/stage={}  samplers/stage={}",
-        l.max_bind_groups, l.max_sampled_textures_per_shader_stage,
-        l.max_samplers_per_shader_stage
+        l.max_bind_groups, l.max_sampled_textures_per_shader_stage, l.max_samplers_per_shader_stage
     );
     s
 }
@@ -221,15 +237,14 @@ pub fn shared_device() -> Option<&'static SharedGpu> {
             let instance =
                 wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
             // HighPerformance + no fallback: adopt the real discrete GPU, not a software rasterizer.
-            let adapter = pollster::block_on(instance.request_adapter(
-                &wgpu::RequestAdapterOptions {
+            let adapter =
+                pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
                     power_preference: wgpu::PowerPreference::HighPerformance,
                     force_fallback_adapter: false,
                     compatible_surface: None,
                     apply_limit_buckets: false, // wgpu 30
-                },
-            ))
-            .ok()?;
+                }))
+                .ok()?;
             // Every stable feature, minus experimental ones (which need an unsafe instance opt-in),
             // so ANY adopter's fast path is satisfied on the one shared device without the whole
             // negotiation failing. `request_max_device` intersects this with `adapter.features()`.
@@ -350,7 +365,9 @@ mod tests {
             "shared_device() Option-state changed between calls"
         );
         match (first, second) {
-            (Some(a), Some(b)) => assert!(std::ptr::eq(a, b), "cached context is not pointer-stable"),
+            (Some(a), Some(b)) => {
+                assert!(std::ptr::eq(a, b), "cached context is not pointer-stable")
+            }
             (None, None) => {}
             _ => unreachable!("is_some() equality already asserted above"),
         }
@@ -381,7 +398,11 @@ mod tests {
         let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
         for adapter in &adapters {
             let budget = vram_budget_bytes(adapter);
-            println!("{}: vram_budget_bytes = {:?}", adapter.get_info().name, budget);
+            println!(
+                "{}: vram_budget_bytes = {:?}",
+                adapter.get_info().name,
+                budget
+            );
         }
     }
 }

@@ -48,6 +48,8 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Foundation",
+    # `GlobalMemoryStatusEx` for `sys_mem()` — a microsecond syscall, NOT a `wmic` process spawn.
+    "Win32_System_SystemInformation",
 ] }
 
 # Linux: Vulkan VK_EXT_memory_budget via `Adapter::as_hal` (WRITTEN, UNVERIFIED).

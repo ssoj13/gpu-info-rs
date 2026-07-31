@@ -109,38 +109,10 @@ pub fn available_ram() -> u64 {
 
 #[cfg(target_os = "windows")]
 fn sys_mem_platform() -> Option<SysMemInfo> {
-    // `wmic OS get TotalVisibleMemorySize,FreePhysicalMemory /format:list`
-    // Returns values in KB.
-    let output = Command::new("wmic")
-        .args([
-            "OS",
-            "get",
-            "TotalVisibleMemorySize,FreePhysicalMemory",
-            "/format:list",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut free_kb: u64 = 0;
-    let mut total_kb: u64 = 0;
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        if let Some(v) = trimmed.strip_prefix("FreePhysicalMemory=") {
-            free_kb = v.trim().parse().unwrap_or(0);
-        } else if let Some(v) = trimmed.strip_prefix("TotalVisibleMemorySize=") {
-            total_kb = v.trim().parse().unwrap_or(0);
-        }
-    }
-    if total_kb == 0 {
-        return None;
-    }
-    Some(SysMemInfo {
-        total_bytes: total_kb * 1024,
-        available_bytes: free_kb * 1024,
-    })
+    // `GlobalMemoryStatusEx` — a MICROSECOND syscall. This replaced a `wmic OS get ...` PROCESS SPAWN
+    // (~0.3-0.5 s) that hitched a consumer's UI thread on every poll (see [`crate::win_mem`]). The
+    // unsafe syscall is isolated in `win_mem` so THIS module keeps its `#![forbid(unsafe_code)]`.
+    crate::win_mem::sys_mem()
 }
 
 #[cfg(target_os = "linux")]
@@ -309,7 +281,7 @@ fn windows_registry_query() -> Option<GpuMemInfo> {
 
         if best
             .as_ref()
-            .map_or(true, |b| info.dedicated_vram > b.dedicated_vram)
+            .is_none_or(|b| info.dedicated_vram > b.dedicated_vram)
         {
             best = Some(info);
         }
