@@ -97,11 +97,8 @@ mod imp {
 
     fn query_local_segment(adapter: &IDXGIAdapter3) -> Option<VramInfo> {
         let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-        unsafe {
-            adapter
-                .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info)
-        }
-        .ok()?;
+        unsafe { adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info) }
+            .ok()?;
         Some(VramInfo {
             used: info.CurrentUsage,
             budget: info.Budget,
@@ -146,8 +143,7 @@ mod imp {
 
     impl VramQuerier {
         pub fn new(ctx: GpuVramContext<'_>) -> Option<Self> {
-            let hal_adapter =
-                unsafe { ctx.adapter.as_hal::<wgpu::hal::api::Vulkan>() }?;
+            let hal_adapter = unsafe { ctx.adapter.as_hal::<wgpu::hal::api::Vulkan>() }?;
             let raw_phys = hal_adapter.raw_physical_device();
             let shared = hal_adapter.shared_instance();
             let instance = shared.raw_instance().clone();
@@ -223,7 +219,9 @@ mod imp {
         device: Retained<ProtocolObject<dyn MTLDevice>>,
     }
 
-    fn mtl_from_wgpu_device(device: &wgpu::Device) -> Option<Retained<ProtocolObject<dyn MTLDevice>>> {
+    fn mtl_from_wgpu_device(
+        device: &wgpu::Device,
+    ) -> Option<Retained<ProtocolObject<dyn MTLDevice>>> {
         let hal = unsafe { device.as_hal::<wgpu::hal::api::Metal>() }?;
         Some(hal.raw_device().clone())
     }

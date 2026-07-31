@@ -128,7 +128,10 @@ impl GpuImage {
         validate_dims(width, height, &gpu.device)?;
         let expected = width as usize * height as usize * 4;
         if rgba.len() != expected {
-            return Err(GpuImageError::PixelCount { expected, got: rgba.len() });
+            return Err(GpuImageError::PixelCount {
+                expected,
+                got: rgba.len(),
+            });
         }
 
         let tex = make_texture(&gpu.device, width, height);
@@ -150,7 +153,11 @@ impl GpuImage {
                 bytes_per_row: Some(width * BYTES_PER_PIXEL),
                 rows_per_image: Some(height),
             },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
         // Flush the staged write so the handle is immediately usable by any consumer, even one
         // that never submits its own work before sampling.
@@ -178,9 +185,11 @@ impl GpuImage {
             mapped_at_creation: false,
         });
 
-        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("GpuImage readback encoder"),
-        });
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("GpuImage readback encoder"),
+            });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.tex,
@@ -196,7 +205,11 @@ impl GpuImage {
                     rows_per_image: Some(height),
                 },
             },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
         gpu.queue.submit(std::iter::once(encoder.finish()));
 
@@ -242,7 +255,8 @@ impl GpuImage {
     /// Create a default [`wgpu::TextureView`] for binding. A fresh view each call (views are cheap).
     #[must_use]
     pub fn view(&self) -> wgpu::TextureView {
-        self.tex.create_view(&wgpu::TextureViewDescriptor::default())
+        self.tex
+            .create_view(&wgpu::TextureViewDescriptor::default())
     }
 
     /// Image width in texels.
@@ -280,7 +294,11 @@ fn validate_dims(width: u32, height: u32, device: &wgpu::Device) -> Result<(), G
 fn make_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("GpuImage"),
-        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -319,7 +337,10 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         println!("GpuImage f16 round-trip max abs error = {max_err:e}");
-        assert!(max_err < 1e-3, "f16 round-trip error {max_err} exceeds 1e-3 bound");
+        assert!(
+            max_err < 1e-3,
+            "f16 round-trip error {max_err} exceeds 1e-3 bound"
+        );
     }
 
     /// `adopt` records dims and exposes texture/view/accessors correctly.

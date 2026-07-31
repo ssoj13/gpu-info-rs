@@ -104,10 +104,28 @@ pub(crate) fn sample_counts_from_flags(flags: wgpu::TextureFormatFeatureFlags) -
 pub(crate) const COMMON_FORMATS: &[wgpu::TextureFormat] = {
     use wgpu::TextureFormat::*;
     &[
-        R8Unorm, Rg8Unorm, Rgba8Unorm, Rgba8UnormSrgb, Bgra8Unorm, Bgra8UnormSrgb,
-        Rgb10a2Unorm, Rg11b10Ufloat, R16Float, Rg16Float, Rgba16Float, R32Float,
-        Rg32Float, Rgba32Float, R32Uint, Rgba32Uint, Depth16Unorm, Depth24Plus,
-        Depth24PlusStencil8, Depth32Float, Bc1RgbaUnorm, Bc7RgbaUnorm,
+        R8Unorm,
+        Rg8Unorm,
+        Rgba8Unorm,
+        Rgba8UnormSrgb,
+        Bgra8Unorm,
+        Bgra8UnormSrgb,
+        Rgb10a2Unorm,
+        Rg11b10Ufloat,
+        R16Float,
+        Rg16Float,
+        Rgba16Float,
+        R32Float,
+        Rg32Float,
+        Rgba32Float,
+        R32Uint,
+        Rgba32Uint,
+        Depth16Unorm,
+        Depth24Plus,
+        Depth24PlusStencil8,
+        Depth32Float,
+        Bc1RgbaUnorm,
+        Bc7RgbaUnorm,
     ]
 };
 
@@ -161,7 +179,11 @@ impl AdapterReport {
                 let tf = adapter.get_texture_format_features(format);
                 TextureFormatReport {
                     format: format!("{format:?}"),
-                    allowed_usages: tf.allowed_usages.iter_names().map(|(n, _)| n.to_string()).collect(),
+                    allowed_usages: tf
+                        .allowed_usages
+                        .iter_names()
+                        .map(|(n, _)| n.to_string())
+                        .collect(),
                     flags: tf.flags.iter_names().map(|(n, _)| n.to_string()).collect(),
                     sample_counts: sample_counts_from_flags(tf.flags),
                 }
@@ -180,12 +202,20 @@ impl AdapterReport {
             driver_info: info.driver_info,
             subgroup_min_size: info.subgroup_min_size,
             subgroup_max_size: info.subgroup_max_size,
-            features: adapter.features().iter_names().map(|(n, _)| n.to_string()).collect(),
+            features: adapter
+                .features()
+                .iter_names()
+                .map(|(n, _)| n.to_string())
+                .collect(),
             limits: adapter.limits(),
             downlevel: DownlevelReport {
                 is_webgpu_compliant: downlevel.is_webgpu_compliant(),
                 shader_model: shader_model_str(downlevel.shader_model).to_string(),
-                flags: downlevel.flags.iter_names().map(|(n, _)| n.to_string()).collect(),
+                flags: downlevel
+                    .flags
+                    .iter_names()
+                    .map(|(n, _)| n.to_string())
+                    .collect(),
             },
             texture_formats,
         }
@@ -241,7 +271,11 @@ fn diff_value(path: &str, a: &serde_json::Value, b: &serde_json::Value, out: &mu
             keys.sort();
             keys.dedup();
             for k in keys {
-                let child = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
+                let child = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}.{k}")
+                };
                 match (ma.get(k), mb.get(k)) {
                     (Some(va), Some(vb)) => diff_value(&child, va, vb, out),
                     (Some(va), None) => out.push(format!("{child}: {va} -> (removed)")),
@@ -302,7 +336,11 @@ impl GpuReport {
             if !a.pci_bus_id.is_empty() {
                 let _ = writeln!(s, "    pci bus id  : {}", a.pci_bus_id);
             }
-            let _ = writeln!(s, "    subgroup    : {}..{}", a.subgroup_min_size, a.subgroup_max_size);
+            let _ = writeln!(
+                s,
+                "    subgroup    : {}..{}",
+                a.subgroup_min_size, a.subgroup_max_size
+            );
             let _ = writeln!(
                 s,
                 "    downlevel   : shader_model={}, webgpu_compliant={}",
@@ -346,10 +384,9 @@ impl GpuReport {
 fn limits_kv(limits: &wgpu::Limits) -> Vec<(String, String)> {
     let value = serde_json::to_value(limits).expect("Limits is serializable");
     let mut pairs: Vec<(String, String)> = match value {
-        serde_json::Value::Object(map) => map
-            .into_iter()
-            .map(|(k, v)| (k, v.to_string()))
-            .collect(),
+        serde_json::Value::Object(map) => {
+            map.into_iter().map(|(k, v)| (k, v.to_string())).collect()
+        }
         _ => Vec::new(),
     };
     pairs.sort_by(|a, b| a.0.cmp(&b.0));

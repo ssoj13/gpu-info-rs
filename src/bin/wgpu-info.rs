@@ -6,7 +6,11 @@ use clap::Parser;
 use gpu_info::{GpuReport, wgpu};
 
 #[derive(Parser)]
-#[command(name = "wgpu-info", version, about = "Report GPU capabilities via wgpu")]
+#[command(
+    name = "wgpu-info",
+    version,
+    about = "Report GPU capabilities via wgpu"
+)]
 struct Args {
     /// Emit the full report as JSON instead of a human-readable table.
     #[arg(long)]
@@ -33,7 +37,11 @@ fn parse_backends(name: &str) -> Result<wgpu::Backends, String> {
         "dx12" | "d3d12" => wgpu::Backends::DX12,
         "metal" | "mtl" => wgpu::Backends::METAL,
         "gl" | "opengl" | "gles" => wgpu::Backends::GL,
-        other => return Err(format!("unknown backend '{other}' (use vulkan|dx12|metal|gl|primary|all)")),
+        other => {
+            return Err(format!(
+                "unknown backend '{other}' (use vulkan|dx12|metal|gl|primary|all)"
+            ));
+        }
     })
 }
 
