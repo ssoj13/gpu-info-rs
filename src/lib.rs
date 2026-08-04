@@ -229,10 +229,13 @@ static SHARED: std::sync::OnceLock<Option<SharedGpu>> = std::sync::OnceLock::new
 /// results across two physical devices.
 ///
 /// The device is built with the adapter's MAXIMUM limits and every supported *stable* feature
-/// ([`wgpu::Features::all`] minus [`wgpu::Features::all_experimental_mask`], intersected with the
-/// adapter's real feature set), so an adopter that needs e.g. `TIMESTAMP_QUERY` or
+/// ([`wgpu::Features::all`] minus [`wgpu::Features::all_experimental_mask`] and minus
+/// [`wgpu::Features::MAPPABLE_PRIMARY_BUFFERS`], intersected with the adapter's real feature set),
+/// so an adopter that needs e.g. `TIMESTAMP_QUERY` or
 /// `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` for its fast path finds them present, while an
-/// adopter that doesn't simply ignores them. Experimental features (ray-query, mesh-shader,
+/// adopter that doesn't simply ignores them. `MAPPABLE_PRIMARY_BUFFERS` is excluded because wgpu
+/// treats enabling it on a discrete GPU as a performance footgun and nobody maps primary buffers.
+/// Experimental features (ray-query, mesh-shader,
 /// cooperative-matrix …) are excluded on purpose: wgpu 30 rejects them at `request_device` unless
 /// the caller flips an `unsafe { ExperimentalFeatures::enabled() }` opt-in, and requesting them
 /// would make the whole negotiation fail with "experimental features are not enabled".
@@ -256,7 +259,12 @@ pub fn shared_device() -> Option<&'static SharedGpu> {
             // Every stable feature, minus experimental ones (which need an unsafe instance opt-in),
             // so ANY adopter's fast path is satisfied on the one shared device without the whole
             // negotiation failing. `request_max_device` intersects this with `adapter.features()`.
-            let stable_features = wgpu::Features::all() & !wgpu::Features::all_experimental_mask();
+            //
+            // Strip MAPPABLE_PRIMARY_BUFFERS: wgpu warns loudly when it is enabled on a discrete
+            // GPU ("massive performance footgun"). Nobody in the cluster maps primary buffers;
+            // vfx-view / squarebob already subtract it for the same reason.
+            let stable_features = (wgpu::Features::all() & !wgpu::Features::all_experimental_mask())
+                .difference(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
             let (device, queue) =
                 pollster::block_on(request_max_device(&adapter, stable_features)).ok()?;
             Some(SharedGpu {
