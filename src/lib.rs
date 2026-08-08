@@ -49,6 +49,13 @@ mod win_mem;
 /// Complements the wgpu capability report and the DXGI [`vram`] adapter budget.
 pub mod os;
 
+/// Device caps and the single "does this fit one dispatch" question, shared by every tiling
+/// consumer in the cluster. wgpu-free at the core — see the module docs for why the FACTS live
+/// here while tile-sizing POLICY stays with each consumer.
+pub mod limits;
+
+pub use limits::{GpuLimits, TilingReason};
+
 #[cfg(feature = "wgpu")]
 pub use image::{GpuImage, GpuImageError};
 #[cfg(feature = "wgpu")]
