@@ -32,8 +32,11 @@
 
 /// Canonical GPU media-image handle ([`GpuImage`]) shared by every cluster GPU consumer.
 /// Lives here because this crate anchors wgpu and owns [`shared_device`] (cycle-free).
+#[cfg(feature = "wgpu")]
 pub mod image;
+#[cfg(feature = "wgpu")]
 mod model;
+#[cfg(feature = "wgpu")]
 mod vram;
 /// Windows RAM via `GlobalMemoryStatusEx` (a syscall, not a `wmic` process spawn) — see [`win_mem`].
 #[cfg(windows)]
@@ -46,13 +49,17 @@ mod win_mem;
 /// Complements the wgpu capability report and the DXGI [`vram`] adapter budget.
 pub mod os;
 
+#[cfg(feature = "wgpu")]
 pub use image::{GpuImage, GpuImageError};
+#[cfg(feature = "wgpu")]
 pub use model::{AdapterReport, DownlevelReport, GpuReport, TextureFormatReport};
+#[cfg(feature = "wgpu")]
 pub use vram::{
     GpuVramContext, VramInfo, VramQuerier, vram_budget_bytes, vram_budget_from_context,
 };
 
 /// Re-exported so consumers spell `wgpu` types from a single, version-matched source.
+#[cfg(feature = "wgpu")]
 pub use wgpu;
 
 /// Enumerate every adapter wgpu can find across all backends and report its capabilities.
@@ -60,12 +67,14 @@ pub use wgpu;
 /// Synchronous: wgpu's adapter enumeration is async internally and is driven to completion
 /// here via [`pollster`].
 #[must_use]
+#[cfg(feature = "wgpu")]
 pub fn query() -> GpuReport {
     query_backends(wgpu::Backends::all())
 }
 
 /// Like [`query`], but restricted to the given backends (e.g. `wgpu::Backends::VULKAN`).
 #[must_use]
+#[cfg(feature = "wgpu")]
 pub fn query_backends(backends: wgpu::Backends) -> GpuReport {
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
     desc.backends = backends;
@@ -88,6 +97,7 @@ pub fn query_backends(backends: wgpu::Backends) -> GpuReport {
 /// This is exactly [`wgpu::Adapter::limits`]; the named helper documents intent at the call
 /// site — pass the result as `required_limits` instead of [`wgpu::Limits::default`].
 #[must_use]
+#[cfg(feature = "wgpu")]
 pub fn recommended_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
     adapter.limits()
 }
@@ -101,12 +111,14 @@ pub fn recommended_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
 /// GPU may support more MSAA counts for color than for depth; committing to a level only one
 /// side supports panics at texture creation.
 #[must_use]
+#[cfg(feature = "wgpu")]
 pub fn supported_sample_counts(adapter: &wgpu::Adapter, format: wgpu::TextureFormat) -> Vec<u32> {
     model::sample_counts_from_flags(adapter.get_texture_format_features(format).flags)
 }
 
 /// A compact, multi-line summary of a chosen adapter for startup logging.
 #[must_use]
+#[cfg(feature = "wgpu")]
 pub fn adapter_summary(adapter: &wgpu::Adapter) -> String {
     use core::fmt::Write as _;
     let r = AdapterReport::from_adapter(adapter);
@@ -168,6 +180,7 @@ pub fn adapter_summary(adapter: &wgpu::Adapter) -> String {
 /// `wgpu::Features::all() & !wgpu::Features::all_experimental_mask()` instead (this is what
 /// [`shared_device`] does). The returned device's limits equal `adapter.limits()`, eliminating the
 /// `Limits::default()` guessing game.
+#[cfg(feature = "wgpu")]
 pub async fn request_max_device(
     adapter: &wgpu::Adapter,
     extra_features: wgpu::Features,
@@ -183,6 +196,7 @@ pub async fn request_max_device(
 }
 
 /// Blocking wrapper around [`request_max_device`] for non-async callers.
+#[cfg(feature = "wgpu")]
 pub fn request_max_device_blocking(
     adapter: &wgpu::Adapter,
     extra_features: wgpu::Features,
@@ -198,6 +212,7 @@ pub fn request_max_device_blocking(
 /// shares ONE physical device. That is what makes zero-copy interop possible: decoded frames and
 /// compute results all live on the same device instead of being split across independently
 /// negotiated ones.
+#[cfg(feature = "wgpu")]
 pub struct SharedGpu {
     /// The shared logical device (max limits + every supported feature). Clone to adopt.
     pub device: wgpu::Device,
@@ -218,6 +233,7 @@ pub struct SharedGpu {
 /// Cached result of THE single process-wide device negotiation. `None` = the negotiation ran and
 /// no adapter/device was available — a cached negative, so a GPU-less machine does not re-probe
 /// on every call.
+#[cfg(feature = "wgpu")]
 static SHARED: std::sync::OnceLock<Option<SharedGpu>> = std::sync::OnceLock::new();
 
 /// Borrow the process-wide shared GPU context, negotiating it EXACTLY ONCE.
@@ -242,6 +258,7 @@ static SHARED: std::sync::OnceLock<Option<SharedGpu>> = std::sync::OnceLock::new
 ///
 /// Returns `None` (cached) when no adapter is available or device creation fails — never panics.
 /// [`OnceLock::get_or_init`] collapses concurrent first callers into ONE negotiation.
+#[cfg(feature = "wgpu")]
 pub fn shared_device() -> Option<&'static SharedGpu> {
     SHARED
         .get_or_init(|| {
@@ -279,9 +296,13 @@ pub fn shared_device() -> Option<&'static SharedGpu> {
 
 /// Major wgpu version this crate targets. Pinned to the `wgpu = "30"` dependency in
 /// `Cargo.toml`; semver keeps the major at 30 for every 30.x patch.
+#[cfg(feature = "wgpu")]
 const WGPU_VERSION: &str = "30";
 
-#[cfg(test)]
+// Gated with the half they exercise: every fixture here builds a `GpuReport`, which only exists
+// when the `wgpu` feature is on. `os` is covered by its own module's tests, which stay available
+// in a CPU-only build — that being the point of the split.
+#[cfg(all(test, feature = "wgpu"))]
 mod tests {
     use super::*;
 

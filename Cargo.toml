@@ -15,20 +15,31 @@ path = "src/bin/wgpu-info.rs"
 required-features = ["cli"]
 
 [features]
-default = ["cli"]
+default = ["cli", "wgpu"]
+
+# The wgpu-dependent half: capability reporting, the shared device, GpuImage, and the
+# adapter VRAM budget. Split out so a CPU-only consumer can take `gpu_info::os` — an OS-level
+# VRAM/RAM query that needs no GPU context and no wgpu — WITHOUT pulling wgpu into its build.
+#
+# Requested by a consumer note in oiio-rs (`vfx-compute/src/backend/vram.rs`, TODO(gpu-info-rs)):
+# that module had to gate itself on its own `wgpu` feature purely because this crate pulled wgpu
+# unconditionally, and `vfx-warp` paid the same tax for one `gpu_mem::os::sys_mem()` call.
+#
+# ON BY DEFAULT, so every existing consumer is unaffected.
 # CLI binary deps. The library itself never needs clap.
-cli = ["dep:clap"]
+cli = ["dep:clap", "wgpu"] # the CLI reports wgpu capabilities, so it implies the wgpu half
+wgpu = ["dep:wgpu", "dep:pollster"]
 
 [dependencies]
 # OS-level VRAM/RAM (no GPU context) - re-exported as `wgpu_info::gpu_mem`.
 # Pinned to match the workspace wgpu in gitnexus-rs / vfx-rs (avoids a second wgpu+naga copy).
 # `serde` lets us serialize wgpu's own Limits/AdapterInfo straight into the report.
-wgpu = { version = "30", features = ["serde"] }
+wgpu = { version = "30", features = ["serde"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # wgpu adapter enumeration / device creation are async; we block on them so the
 # public query API stays synchronous and ergonomic for non-async callers.
-pollster = "0.4"
+pollster = { version = "0.4", optional = true } # drives wgpu's async adapter/device requests
 clap = { version = "4", features = ["derive"], optional = true }
 log = "0.4"
 # GpuImage host<->GPU boundary: Rgba16Float stores half-floats, so the f32 host API converts via
