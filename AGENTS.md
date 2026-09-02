@@ -1,4 +1,22 @@
-# Integrating `wgpu-info-rs` — guide for LLM coding agents
+# Integrating `gpu-info-rs` — guide for LLM coding agents
+
+> **Pick the right module first.** This guide covers the **wgpu capability** half. Two other
+> halves exist and need no wgpu at all:
+>
+> | Need | Module | Cost | Docs |
+> | --- | --- | --- | --- |
+> | adapter limits / features / formats | `gpu_info::query` | one-shot | this file |
+> | "how much VRAM does this box have" | `gpu_info::os` | ~1 s on macOS (spawns) | `src/os.rs` |
+> | live GPU graph, polled 1-10 Hz | `gpu_info::stats` | ~33 µs (no spawns) | `src/stats.rs` |
+>
+> For a monitor widget the answer is **always `stats`**, never `os`: `os` shells out to
+> `system_profiler` / `nvidia-smi`, which hitches the caller's UI thread once per sample.
+> `stats` is IOKit on macOS and DRM sysfs on Linux, and its module contract forbids process
+> spawns — unavailable counters come back as `None` rather than as a spawn or a fake `0`.
+> Take it with `default-features = false` and you pull no wgpu at all.
+
+---
+
 
 **Audience:** an AI coding assistant adding `wgpu-info-rs` to *another* Rust project
 (e.g. `gitnexus-rs`, `vfx-rs`). Follow these steps literally. Do not improvise the API —

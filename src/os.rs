@@ -495,10 +495,10 @@ fn macos_system_profiler() -> Option<(String, u64)> {
         }
 
         // "VRAM (Total):  8 GB"  or  "VRAM (Dynamic, Max): 48 GB"
-        if trimmed.starts_with("VRAM") {
-            if let Some(colon_rest) = trimmed.split_once(':') {
-                vram = parse_size_string(colon_rest.1.trim()).unwrap_or(0);
-            }
+        if trimmed.starts_with("VRAM")
+            && let Some(colon_rest) = trimmed.split_once(':')
+        {
+            vram = parse_size_string(colon_rest.1.trim()).unwrap_or(0);
         }
     }
 

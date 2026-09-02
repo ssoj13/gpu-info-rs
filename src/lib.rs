@@ -49,6 +49,11 @@ mod win_mem;
 /// Complements the wgpu capability report and the DXGI [`vram`] adapter budget.
 pub mod os;
 
+/// Live GPU counters (utilisation, memory in use) cheap enough to poll from a UI frame loop:
+/// IOKit on macOS, DRM sysfs on Linux, wgpu-free and **spawn-free**. Use this for monitors and
+/// [`os`] for one-shot capability probes — `os` shells out and costs ~1 s per call on macOS.
+pub mod stats;
+
 /// Device caps and the single "does this fit one dispatch" question, shared by every tiling
 /// consumer in the cluster. wgpu-free at the core — see the module docs for why the FACTS live
 /// here while tile-sizing POLICY stays with each consumer.
