@@ -1,14 +1,14 @@
 //! Query GPU video memory (VRAM) on Windows, Linux, and macOS.
 //!
-//! **Zero `unsafe`, zero dependencies** — every platform is queried through
-//! safe OS interfaces (`nvidia-smi`, `reg query`, sysfs, `system_profiler`).
+//! **Zero `unsafe` in this module** — the platform shells are safe OS interfaces
+//! (`nvidia-smi`, sysfs, `system_profiler`), and the two calls that are not shells
+//! ([`crate::win_mem`], [`crate::stats`]) confine their `unsafe` to their own files.
 //!
 //! # Platform methods
 //!
 //! | Platform | Total VRAM | Free VRAM |
 //! |----------|-----------|-----------|
-//! | Windows (NVIDIA) | `nvidia-smi` or registry | `nvidia-smi` |
-//! | Windows (AMD) | registry `HardwareInformation.qwMemorySize` | 0 (unavailable) |
+//! | Windows (any vendor) | DXGI `EnumAdapters1` | PDH `GPU Adapter Memory`, no spawn |
 //! | Linux (NVIDIA) | `nvidia-smi` | `nvidia-smi` |
 //! | Linux (AMD) | sysfs `mem_info_vram_total` | sysfs (`total − used`) |
 //! | macOS (discrete) | `system_profiler` | 0 (unavailable) |
@@ -28,6 +28,8 @@
 
 #![forbid(unsafe_code)]
 
+/// Only the platforms that still shell out use this — Windows answers through DXGI + PDH.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Command;
 
 // ── Public API ───────────────────────────────────────────────────────────
@@ -161,13 +163,12 @@ fn sys_mem_platform() -> Option<SysMemInfo> {
 
 /// Queries `nvidia-smi` for total, free, used VRAM and GPU name.
 ///
-/// Works on both Windows and Linux.  The `nvidia-smi` binary is shipped
-/// with the NVIDIA driver and is typically in `PATH`
-/// (`C:\Windows\System32\nvidia-smi.exe` on Windows).
+/// Linux only: Windows answers through DXGI + PDH without a spawn, so it no longer needs
+/// this. The `nvidia-smi` binary ships with the NVIDIA driver and is typically in `PATH`.
 ///
 /// Returns `None` if `nvidia-smi` is not installed, exits with an error,
 /// or produces unparseable output.
-#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn nvidia_smi_query() -> Option<GpuMemInfo> {
     let output = Command::new("nvidia-smi")
         .args([
@@ -225,135 +226,25 @@ fn platform_query() -> Option<GpuMemInfo> {
 // Windows
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Windows strategy:
-/// 1. Try `nvidia-smi` first — gives total, free, and name in one call.
-/// 2. Fall back to the Display Adapter registry class for total VRAM
-///    (AMD / Intel / older NVIDIA without nvidia-smi in PATH).
+/// Windows: DXGI + PDH, via [`crate::stats`].
+///
+/// One source, no process spawn, every vendor. This used to run `nvidia-smi` and then
+/// `reg query` — two spawns, ~0.4 s of wall clock, and the useful half was NVIDIA-only.
+/// Those are gone rather than kept behind the fast path: a shell-out that only ever runs
+/// when DXGI is missing is a path nobody exercises and nobody notices rotting, and on a
+/// machine with no DXGI there is no GPU worth reporting either.
+///
+/// Same move [`crate::win_mem`] made when it replaced `wmic` with `GlobalMemoryStatusEx`.
 #[cfg(target_os = "windows")]
 fn windows_query() -> Option<GpuMemInfo> {
-    // Fast path: nvidia-smi gives us everything, including free VRAM.
-    if let Some(info) = nvidia_smi_query() {
-        return Some(info);
-    }
-
-    // Fallback: registry (total only, no free VRAM).
-    windows_registry_query()
-}
-
-/// Reads total VRAM and GPU name from the display adapter registry class.
-///
-/// This works for all GPU vendors but does **not** provide free VRAM.
-#[cfg(target_os = "windows")]
-fn windows_registry_query() -> Option<GpuMemInfo> {
-    /// Display adapter class GUID (stable across all Windows versions).
-    const DISPLAY_CLASS: &str =
-        r"HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
-
-    let mut best: Option<GpuMemInfo> = None;
-
-    // Enumerate sub-keys 0000 … 0015 (covers multi-GPU setups).
-    for i in 0..16u32 {
-        let subkey = format!(r"{DISPLAY_CLASS}\{i:04}");
-
-        // 64-bit VRAM (modern drivers, >4 GB GPUs).
-        let vram = reg_query_hex(&subkey, "HardwareInformation.qwMemorySize")
-            // Fallback: 32-bit VRAM (older drivers, ≤4 GB).
-            .or_else(|| reg_query_hex(&subkey, "HardwareInformation.MemorySize"))
-            .unwrap_or(0);
-
-        if vram == 0 {
-            continue;
-        }
-
-        let name = reg_query_string(&subkey, "DriverDesc")
-            .or_else(|| reg_query_string(&subkey, "Device Description"))
-            .unwrap_or_default();
-
-        let shared = reg_query_hex(&subkey, "HardwareInformation.SharedSystemMemory").unwrap_or(0);
-
-        let info = GpuMemInfo {
-            name,
-            dedicated_vram: vram,
-            free_vram: 0, // Registry doesn't expose free VRAM.
-            shared_memory: shared,
-            unified: false,
-        };
-
-        if best
-            .as_ref()
-            .is_none_or(|b| info.dedicated_vram > b.dedicated_vram)
-        {
-            best = Some(info);
-        }
-    }
-
-    best
-}
-
-// ── Windows registry helpers ─────────────────────────────────────────────
-
-/// Runs `reg query <key> /v <value>` and returns the raw data string.
-#[cfg(target_os = "windows")]
-fn reg_query_raw(key: &str, value_name: &str) -> Option<String> {
-    let output = Command::new("reg")
-        .args(["query", key, "/v", value_name])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_reg_value(&stdout, value_name)
-}
-
-/// Parses a hex value (`0x…`) from a `reg query` result line.
-#[cfg(target_os = "windows")]
-fn reg_query_hex(key: &str, value_name: &str) -> Option<u64> {
-    let data = reg_query_raw(key, value_name)?;
-    let hex = data.trim_start_matches("0x").trim_start_matches("0X");
-    u64::from_str_radix(hex, 16).ok()
-}
-
-/// Parses a string value (`REG_SZ`) from a `reg query` result line.
-#[cfg(target_os = "windows")]
-fn reg_query_string(key: &str, value_name: &str) -> Option<String> {
-    let data = reg_query_raw(key, value_name)?;
-    if data.is_empty() { None } else { Some(data) }
-}
-
-/// Extracts the data field from a `reg query` output line.
-///
-/// Expected format (language-independent):
-/// ```text
-///     HardwareInformation.qwMemorySize    REG_QWORD    0x200000000
-///     DriverDesc    REG_SZ    NVIDIA GeForce RTX 4090
-/// ```
-///
-/// The value name and `REG_*` type tag are always ASCII.
-#[cfg(target_os = "windows")]
-fn parse_reg_value(stdout: &str, value_name: &str) -> Option<String> {
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        // Locate the `REG_` type marker.
-        let Some(reg_pos) = trimmed.find("REG_") else {
-            continue;
-        };
-        // Everything before it is the value name.
-        let name = trimmed[..reg_pos].trim();
-        if !name.eq_ignore_ascii_case(value_name) {
-            continue;
-        }
-        // Everything after `REG_xxxx<whitespace>` is the data.
-        let type_and_data = &trimmed[reg_pos..];
-        let Some(space) = type_and_data.find(char::is_whitespace) else {
-            continue;
-        };
-        let data = type_and_data[space..].trim();
-        if !data.is_empty() {
-            return Some(data.to_string());
-        }
-    }
-    None
+    let (name, total, shared, used, unified) = crate::stats::windows_adapter_memory()?;
+    (total > 0).then(|| GpuMemInfo {
+        name,
+        dedicated_vram: total,
+        free_vram: total.saturating_sub(used),
+        shared_memory: shared,
+        unified,
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -631,30 +522,6 @@ mod tests {
         assert_eq!(total, 12288);
         assert_eq!(free, 10783);
         assert_eq!(name, "NVIDIA GeForce RTX 3080 Ti");
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn parse_reg_qword() {
-        let output = r#"
-HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0000
-    HardwareInformation.qwMemorySize    REG_QWORD    0x300000000
-"#;
-        let val = parse_reg_value(output, "HardwareInformation.qwMemorySize");
-        assert_eq!(val.as_deref(), Some("0x300000000"));
-        let bytes = u64::from_str_radix("300000000", 16).unwrap();
-        assert_eq!(bytes, 12 * 1024 * 1024 * 1024); // 12 GB
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn parse_reg_sz() {
-        let output = r#"
-HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0000
-    DriverDesc    REG_SZ    NVIDIA GeForce RTX 4090
-"#;
-        let val = parse_reg_value(output, "DriverDesc");
-        assert_eq!(val.as_deref(), Some("NVIDIA GeForce RTX 4090"));
     }
 
     #[cfg(target_os = "macos")]

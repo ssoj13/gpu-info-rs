@@ -18,8 +18,8 @@
 //! |---|---|---|---|
 //! | macOS (Apple GPU) | yes | yes | IOKit `IOAccelerator` → `PerformanceStatistics` (same numbers Activity Monitor graphs), unprivileged |
 //! | Linux (AMD/Intel) | yes | yes | DRM sysfs `gpu_busy_percent`, `mem_info_vram_*` |
-//! | Linux/Windows (NVIDIA) | no | no | needs NVML; `nvidia-smi` would be a spawn, so it is deliberately not used here |
-//! | Windows (other) | no | no | PDH / DXGI budget not wired yet |
+//! | Windows (any vendor) | yes | yes | PDH `GPU Engine` counters + DXGI `QueryVideoMemoryInfo` — the pair Task Manager reads, so NVML and `nvidia-smi` are not needed |
+//! | Linux (NVIDIA) | no | no | needs NVML; `nvidia-smi` would be a spawn, so it is deliberately not used here |
 //!
 //! Callers that need the missing pieces should fall back to [`os::query`](crate::os::query)
 //! themselves, on their own slow path, and cache the result.
@@ -28,6 +28,16 @@
 mod apple;
 #[cfg(target_os = "linux")]
 mod drm;
+#[cfg(target_os = "windows")]
+mod windows;
+
+/// Adapter name and memory with no process spawn, for [`crate::os`]'s Windows path.
+///
+/// Re-exported here so `os` never reaches into a platform submodule of its own accord.
+#[cfg(target_os = "windows")]
+pub(crate) fn windows_adapter_memory() -> Option<(String, u64, u64, u64, bool)> {
+    windows::adapter_memory()
+}
 
 /// One live GPU reading.
 ///
@@ -77,7 +87,11 @@ pub fn query() -> Option<GpuStats> {
     {
         drm::query()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::query()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         None
     }
