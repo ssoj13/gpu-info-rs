@@ -29,6 +29,8 @@ mod apple;
 #[cfg(target_os = "linux")]
 mod drm;
 #[cfg(target_os = "windows")]
+mod nvml;
+#[cfg(target_os = "windows")]
 mod windows;
 
 /// Adapter name and memory with no process spawn, for [`crate::os`]'s Windows path.
@@ -37,6 +39,28 @@ mod windows;
 #[cfg(target_os = "windows")]
 pub(crate) fn windows_adapter_memory() -> Option<(String, u64, u64, u64, bool)> {
     windows::adapter_memory()
+}
+
+/// Fills in the fields Windows itself does not publish, where a vendor library can.
+///
+/// Enrichment, not a fallback: the base reading is complete on its own for every vendor, and
+/// this only adds what PDH has no counter for.
+#[cfg(target_os = "windows")]
+fn enrich(stats: &mut GpuStats) {
+    let Some(name) = stats.name.as_deref() else {
+        return;
+    };
+    let Some(n) = nvml::query(name) else {
+        return;
+    };
+    stats.temp_c = n.temp_c;
+    stats.power_w = n.power_w;
+    stats.power_limit_w = n.power_limit_w;
+    stats.fan_pct = n.fan_pct;
+    stats.clock_core_mhz = n.clock_core_mhz;
+    stats.clock_mem_mhz = n.clock_mem_mhz;
+    stats.mem_bus_pct = n.mem_bus_pct;
+    stats.driver = n.driver;
 }
 
 /// One live GPU reading.
@@ -56,6 +80,27 @@ pub struct GpuStats {
     pub mem_total_bytes: Option<u64>,
     /// GPU shares system RAM (Apple Silicon, integrated GPUs).
     pub unified: bool,
+    /// Core temperature in °C.
+    ///
+    /// The fields below come from a vendor library where one is present — see
+    /// [`nvml`](self) on Windows. Windows publishes no thermal, clock, power or fan counter
+    /// of its own, so they are `None` on an AMD or Intel GPU until ADL and IGCL are wired in
+    /// the same shape.
+    pub temp_c: Option<f32>,
+    /// Board power draw in watts.
+    pub power_w: Option<f32>,
+    /// The power limit currently enforced, in watts.
+    pub power_limit_w: Option<f32>,
+    /// Fan duty cycle as a percentage of maximum — not RPM.
+    pub fan_pct: Option<f32>,
+    /// Graphics clock in MHz.
+    pub clock_core_mhz: Option<u32>,
+    /// Memory clock in MHz.
+    pub clock_mem_mhz: Option<u32>,
+    /// Memory-*controller* utilisation: how busy the bus was, not how full the VRAM is.
+    pub mem_bus_pct: Option<f32>,
+    /// Driver version, when the vendor library reports one.
+    pub driver: Option<String>,
 }
 
 impl GpuStats {
@@ -67,6 +112,13 @@ impl GpuStats {
             return None;
         }
         Some((used as f32 / total as f32).clamp(0.0, 1.0))
+    }
+
+    /// Power draw as a fraction of the enforced limit, or `None` when either side is unknown.
+    pub fn power_frac(&self) -> Option<f32> {
+        let used = self.power_w?;
+        let limit = self.power_limit_w?;
+        (limit > 0.0).then(|| (used / limit).clamp(0.0, 1.0))
     }
 
     /// True when the reading carries no usable counter, so a caller can skip drawing a section.
@@ -89,7 +141,9 @@ pub fn query() -> Option<GpuStats> {
     }
     #[cfg(target_os = "windows")]
     {
-        windows::query()
+        let mut stats = windows::query()?;
+        enrich(&mut stats);
+        Some(stats)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {

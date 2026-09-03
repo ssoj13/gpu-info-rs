@@ -62,8 +62,11 @@ windows = { version = "0.62", features = [
     # `GlobalMemoryStatusEx` for `sys_mem()` — a microsecond syscall, NOT a `wmic` process spawn.
     "Win32_System_SystemInformation",
     # PDH `GPU Engine` counters for live GPU utilisation (`stats::windows`) — the vendor-neutral
-    # source Task Manager reads, so no NVML/ADL and no `nvidia-smi` spawn.
+    # source Task Manager reads, so no `nvidia-smi` spawn.
     "Win32_System_Performance",
+    # `LoadLibrary`/`GetProcAddress` for the optional NVML enrichment (`stats::nvml`), which
+    # is resolved at run time so a machine with no NVIDIA driver still starts.
+    "Win32_System_LibraryLoader",
 ] }
 
 # Linux: Vulkan VK_EXT_memory_budget via `Adapter::as_hal` (WRITTEN, UNVERIFIED).

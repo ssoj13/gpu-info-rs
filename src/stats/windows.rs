@@ -96,6 +96,9 @@ pub fn query() -> Option<GpuStats> {
         mem_used_bytes,
         mem_total_bytes: Some(adapter.total_bytes).filter(|b| *b > 0),
         unified: adapter.unified,
+        // Windows publishes no thermal, clock, power or fan counter; `super::enrich` fills
+        // these in from a vendor library when one is installed.
+        ..Default::default()
     };
     (!stats.is_empty()).then_some(stats)
 }
