@@ -322,6 +322,8 @@ pub(super) fn query() -> Option<GpuStats> {
             mem_used_bytes: used,
             mem_total_bytes: if unified { sys_memsize() } else { None },
             unified,
+            // IOKit PerformanceStatistics has no thermal, clock, power or fan counters.
+            ..Default::default()
         });
     }
     None

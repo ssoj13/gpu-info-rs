@@ -44,6 +44,8 @@ fn card(index: u32) -> Option<GpuStats> {
         // Discrete VRAM. An integrated part reports a tiny carve-out rather than system RAM,
         // so claiming "unified" would invite callers to size budgets off the wrong pool.
         unified: false,
+        // DRM sysfs does not publish thermal, clock, power or fan here.
+        ..Default::default()
     })
 }
 
