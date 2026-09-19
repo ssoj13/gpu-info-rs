@@ -222,7 +222,9 @@ impl Nvml {
         let mut buf = [0_u8; NAME_LEN];
         // SAFETY: as `name_of` — a buffer of the length NVML is given.
         let status = unsafe { (self.driver)(buf.as_mut_ptr().cast(), NAME_LEN as c_uint) };
-        (status == NVML_SUCCESS).then(|| c_str(&buf)).filter(|s| !s.is_empty())
+        (status == NVML_SUCCESS)
+            .then(|| c_str(&buf))
+            .filter(|s| !s.is_empty())
     }
 }
 
@@ -242,11 +244,11 @@ fn normalise(name: &str) -> String {
 
 #[cfg(windows)]
 mod platform {
-    use std::ffi::{c_void, CStr};
+    use std::ffi::{CStr, c_void};
 
-    use windows::core::{s, PCSTR};
     use windows::Win32::Foundation::HMODULE;
     use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+    use windows::core::{PCSTR, s};
 
     pub type Handle = HMODULE;
 

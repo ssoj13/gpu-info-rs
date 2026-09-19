@@ -232,7 +232,10 @@ mod tests {
     fn total_means_total() {
         const TOTAL: u64 = 8 << 30;
         assert_eq!(GpuLimits::cpu(TOTAL).total_memory, TOTAL);
-        assert_eq!(GpuLimits::new(0, 0, TOTAL, TOTAL / 2, true).total_memory, TOTAL);
+        assert_eq!(
+            GpuLimits::new(0, 0, TOTAL, TOTAL / 2, true).total_memory,
+            TOTAL
+        );
     }
 
     #[test]

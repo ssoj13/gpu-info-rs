@@ -44,16 +44,16 @@
 
 use std::cell::RefCell;
 
-use windows::core::w;
 use windows::Win32::Foundation::LUID;
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE,
+    CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1,
 };
 use windows::Win32::System::Performance::{
+    PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY, PDH_MORE_DATA,
     PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW,
-    PdhOpenQueryW, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY,
-    PDH_MORE_DATA,
+    PdhOpenQueryW,
 };
+use windows::core::w;
 
 use super::GpuStats;
 
@@ -213,10 +213,7 @@ fn describe(raw: &[u16; 128]) -> String {
 
 /// The LUID as PDH spells it in an instance name: high word first, both unsigned.
 fn luid_tag(luid: LUID) -> String {
-    format!(
-        "luid_0x{:08X}_0x{:08X}",
-        luid.HighPart as u32, luid.LowPart
-    )
+    format!("luid_0x{:08X}_0x{:08X}", luid.HighPart as u32, luid.LowPart)
 }
 
 // ── PDH: utilisation and memory in use ─────────────────────────────────────────────────
@@ -357,7 +354,11 @@ impl Counters {
             let ptr = if self.buffer.is_empty() {
                 None
             } else {
-                Some(self.buffer.as_mut_ptr().cast::<PDH_FMT_COUNTERVALUE_ITEM_W>())
+                Some(
+                    self.buffer
+                        .as_mut_ptr()
+                        .cast::<PDH_FMT_COUNTERVALUE_ITEM_W>(),
+                )
             };
             // SAFETY: `size` describes `buffer` exactly; PDH either fills it or reports
             // `PDH_MORE_DATA` and writes the size it needs, which the next pass allocates.

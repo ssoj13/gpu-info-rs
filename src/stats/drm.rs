@@ -25,8 +25,8 @@ pub(super) fn query() -> Option<GpuStats> {
 fn card(index: u32) -> Option<GpuStats> {
     let base = format!("/sys/class/drm/card{index}/device");
 
-    let util_pct = read_u64(&format!("{base}/gpu_busy_percent"))
-        .map(|busy| (busy as f32).clamp(0.0, 100.0));
+    let util_pct =
+        read_u64(&format!("{base}/gpu_busy_percent")).map(|busy| (busy as f32).clamp(0.0, 100.0));
     let mem_total_bytes = read_u64(&format!("{base}/mem_info_vram_total"));
     let mem_used_bytes = read_u64(&format!("{base}/mem_info_vram_used"));
 
@@ -65,7 +65,10 @@ mod tests {
 
     #[test]
     fn absent_paths_are_none() {
-        assert_eq!(read_u64("/sys/class/drm/card999/device/gpu_busy_percent"), None);
+        assert_eq!(
+            read_u64("/sys/class/drm/card999/device/gpu_busy_percent"),
+            None
+        );
         assert_eq!(read_line("/sys/class/drm/card999/device/label"), None);
     }
 

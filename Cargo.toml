@@ -69,8 +69,14 @@ windows = { version = "0.62", features = [
     "Win32_System_LibraryLoader",
 ] }
 
-# Linux: Vulkan VK_EXT_memory_budget via `Adapter::as_hal` (WRITTEN, UNVERIFIED).
-[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+# Vulkan, everywhere Vulkan can exist. TWO consumers now:
+#   - `vram.rs`  : VK_EXT_memory_budget via `Adapter::as_hal` (Linux).
+#   - `shared_vk`: the ONE device that serves wgpu compute AND hardware video decode, plus the raw
+#                  handles a decoder (ffmpeg-rs `av-hwaccel-vulkan`) runs on.
+# Pinned to 0.38, the version wgpu-hal 30 itself uses, so the handles we hand out are the SAME
+# types a consumer built against wgpu-hal sees - a mismatch here would not be a type error at the
+# boundary, it would be two incompatible `ash::Device`s in one process.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ash = { version = "0.38", default-features = false, features = ["std", "loaded"] }
 
 # macOS: Metal MTLDevice via wgpu Device::as_hal (objc2, same types as wgpu-hal 30).

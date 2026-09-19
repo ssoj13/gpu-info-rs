@@ -1,5 +1,25 @@
 # Integrating `gpu-info-rs` — guide for LLM coding agents
 
+## ONE device, and it can decode video (2026-09-19)
+
+`shared_device()` no longer just calls `request_device`. On a Vulkan adapter it builds the logical
+device through `wgpu_hal::vulkan::Adapter::open_with_callback`, ADDING the `VK_KHR_video_*`
+extensions and a decode-queue family to what wgpu itself requires, and wgpu then adopts that device
+(`create_device_from_hal`). `SharedGpu::vulkan` carries the raw `ash` handles (entry, instance,
+physical device, device, queue families) for a consumer that speaks Vulkan — a hardware decoder
+(ffmpeg-rs `av-hwaccel-vulkan`) runs on the SAME device, so a decoded image is used by a compute
+pass with **no copy through host memory**. Proven before it was written: an NV12 image filled
+through the decode queue, wrapped with `texture_from_raw`, read by a compute pass — 0 wrong of 4096
+pixels (RTX 3080 Ti, driver 616.64, wgpu 30.0.1).
+
+- `vulkan == None` means this adapter cannot do it (not Vulkan, or no decode queue). That case is
+  logged as a WARNING, because it silently doubles the cost of every decoded frame.
+- The device is created with `ExperimentalFeatures::enabled()` — required for passthrough shaders
+  (CubeCL's SPIR-V / MSL). No experimental FEATURE is requested.
+- Do NOT destroy anything in `SharedGpu::vulkan`: wgpu owns the device.
+- `ash` is pinned to 0.38, the version wgpu-hal 30 uses. A consumer on another `ash` major would
+  get a second, incompatible set of types.
+
 > **Pick the right module first.** This guide covers the **wgpu capability** half. Two other
 > halves exist and need no wgpu at all:
 >
@@ -36,8 +56,8 @@ buffers" trap).
    compile **two** copies of wgpu if versions differ, producing confusing
    "expected `wgpu::Adapter`, found `wgpu::Adapter`" errors.
    - Before integrating, find the host's wgpu version: search its `Cargo.toml`/lockfile for
-     `wgpu = "…"`. This crate is built for **wgpu 29**. If the host is not on 29, STOP and
-     tell the user — do not bump their wgpu without explicit approval.
+     `wgpu = "…"`. This crate is built for **wgpu 30** (`Cargo.toml`). If the host is not on 30,
+     STOP and tell the user — do not bump their wgpu without explicit approval.
 2. **Spell wgpu types via the re-export** `wgpu_info::wgpu` at the integration site, so you
    are guaranteed to use the exact same `wgpu` the helper functions expect.
 3. The crate is **not on crates.io** — depend on it by `path` or `git`.

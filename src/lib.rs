@@ -36,6 +36,10 @@
 pub mod image;
 #[cfg(feature = "wgpu")]
 mod model;
+/// The shared device as raw Vulkan: video extensions, a decode queue, and the `ash` handles a
+/// hardware decoder needs to run on the SAME device wgpu computes on.
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+pub mod shared_vk;
 #[cfg(feature = "wgpu")]
 mod vram;
 /// Windows RAM via `GlobalMemoryStatusEx` (a syscall, not a `wmic` process spawn) — see [`win_mem`].
@@ -240,6 +244,15 @@ pub struct SharedGpu {
     /// different physical device than every compute consumer adopting this one — exactly the split
     /// this module exists to prevent.
     pub instance: wgpu::Instance,
+    /// The same device seen as raw Vulkan, when it could be created that way.
+    ///
+    /// `Some` means this device also carries the video extensions and a decode queue family, so a
+    /// hardware decoder can run on it and hand its images straight to wgpu with no copy (see
+    /// [`shared_vk`]). `None` means the adapter is not Vulkan, or has no video-decode queue: a
+    /// decoder then needs its own device and every decoded frame costs a round trip through host
+    /// memory. Consumers that care must CHECK this rather than assume it.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub vulkan: Option<shared_vk::VulkanShared>,
 }
 
 /// Cached result of THE single process-wide device negotiation. `None` = the negotiation ran and
@@ -292,8 +305,33 @@ pub fn shared_device() -> Option<&'static SharedGpu> {
             // Strip MAPPABLE_PRIMARY_BUFFERS: wgpu warns loudly when it is enabled on a discrete
             // GPU ("massive performance footgun"). Nobody in the cluster maps primary buffers;
             // vfx-view / squarebob already subtract it for the same reason.
-            let stable_features = (wgpu::Features::all() & !wgpu::Features::all_experimental_mask())
-                .difference(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
+            let stable_features = (wgpu::Features::all()
+                & !wgpu::Features::all_experimental_mask())
+            .difference(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
+            let features = stable_features & adapter.features();
+            let limits = adapter.limits();
+
+            // FIRST try the device that serves both halves: wgpu compute AND hardware video
+            // decode, so a decoded frame never has to travel through host memory to be used.
+            // Only Vulkan can do this; everywhere else we say so and take the ordinary device.
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some((device, queue, vulkan)) =
+                shared_vk::open_shared(&adapter, features, &limits)
+            {
+                return Some(SharedGpu {
+                    device,
+                    queue,
+                    adapter,
+                    instance,
+                    vulkan: Some(vulkan),
+                });
+            }
+            log::warn!(
+                "gpu-info: no shared decode-capable device on the {:?} backend; a hardware decoder \
+                 will need its own device and every decoded frame will be copied through host \
+                 memory",
+                adapter.get_info().backend
+            );
             let (device, queue) =
                 pollster::block_on(request_max_device(&adapter, stable_features)).ok()?;
             Some(SharedGpu {
@@ -301,6 +339,8 @@ pub fn shared_device() -> Option<&'static SharedGpu> {
                 queue,
                 adapter,
                 instance,
+                #[cfg(not(target_arch = "wasm32"))]
+                vulkan: None,
             })
         })
         .as_ref()
