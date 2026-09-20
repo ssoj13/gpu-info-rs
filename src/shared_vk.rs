@@ -85,10 +85,19 @@ pub struct VulkanShared {
     pub device_extensions: Vec<std::ffi::CString>,
     /// The API version the INSTANCE was created with.
     ///
-    /// A consumer whose entry points are core in a later version (`vkCmdPipelineBarrier2` is 1.3)
-    /// has to know this rather than assume it: an unloadable function pointer is not an error, it
-    /// is a crash at the first call.
+    /// This is the LOADER's answer (`vkEnumerateInstanceVersion`), and on its own it says nothing
+    /// about what the device can do - see [`Self::device_api_version`], which is the one a
+    /// consumer must gate on.
     pub instance_api_version: u32,
+    /// The PHYSICAL DEVICE's own `apiVersion`.
+    ///
+    /// This is what decides whether a device entry point exists. `vkCmdPipelineBarrier2` is core
+    /// in 1.3, and a 1.3 loader in front of a 1.2 driver reports 1.3 for the instance while the
+    /// device has no such function - ash fills an unloadable slot with a stub that PANICS at the
+    /// first call, inside whichever library called it. Published separately rather than folded
+    /// into one number so a consumer cannot accidentally gate on the wrong one; the answer to
+    /// "what may I actually call" is [`Self::usable_api_version`].
+    pub device_api_version: u32,
     /// Whether the three features every compute/decode consumer here needs were enabled.
     ///
     /// The device is built with every stable feature the adapter reports, so these are normally
@@ -124,6 +133,27 @@ fn present_video_ext(adapter: &wgpu::hal::vulkan::Adapter) -> Vec<&'static CStr>
         .copied()
         .filter(|e| caps.supports_extension(e))
         .collect()
+}
+
+/// Can `synchronization2` be enabled on this adapter at all?
+///
+/// True when the device is 1.3 (where it is a core feature) or exposes `VK_KHR_synchronization2`.
+/// False means the chained feature struct would be ignored, and a consumer recording `2`-form
+/// barriers would be relying on a function that does not exist.
+fn sync2_possible(adapter: &wgpu::hal::vulkan::Adapter) -> bool {
+    let caps = adapter.physical_device_capabilities();
+    caps.properties().api_version >= vk::API_VERSION_1_3
+        || caps.supports_extension(c"VK_KHR_synchronization2")
+}
+
+/// Does enabling it also require asking for the EXTENSION?
+///
+/// Only below 1.3: there the feature exists solely as `VK_KHR_synchronization2`, and a feature
+/// struct without its extension enables nothing.
+fn sync2_needs_extension(adapter: &wgpu::hal::vulkan::Adapter) -> bool {
+    let caps = adapter.physical_device_capabilities();
+    caps.properties().api_version < vk::API_VERSION_1_3
+        && caps.supports_extension(c"VK_KHR_synchronization2")
 }
 
 /// The first queue family that can decode video, if any.
@@ -180,7 +210,7 @@ pub(crate) fn open_shared(
         Box::new(vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true)),
     );
 
-    let (video_ext, decode, open) = unsafe {
+    let (video_ext, decode, sync2_on, open) = unsafe {
         let hal = adapter.as_hal::<Vulkan>()?;
         let video_ext = present_video_ext(&hal);
         if !VIDEO_CORE.iter().all(|e| video_ext.contains(e)) {
@@ -188,7 +218,21 @@ pub(crate) fn open_shared(
             return None;
         }
         let decode = decode_family(&hal)?;
-        let extra = video_ext.clone();
+        // Whether the feature can be enabled at all, and whether enabling it also means asking
+        // for the extension. Decided HERE, where the adapter is in hand, because the callback
+        // below cannot query it.
+        let sync2_on = sync2_possible(&hal);
+        let sync2_ext = sync2_needs_extension(&hal);
+        if !sync2_on {
+            log::warn!(
+                "gpu-info: this adapter cannot enable synchronization2; a video decoder sharing \
+                 this device would record barriers it does not support"
+            );
+        }
+        let mut extra = video_ext.clone();
+        if sync2_ext {
+            extra.push(c"VK_KHR_synchronization2");
+        }
         let open = hal
             .open_with_callback(
                 features,
@@ -214,10 +258,14 @@ pub(crate) fn open_shared(
                                 .queue_priorities(&PRIORITY),
                         );
                     }
-                    // Chain `synchronization2` on. wgpu never asks for it, and a video decoder
-                    // on this device records every barrier in the `2` form.
-                    let taken = core::mem::take(args.create_info);
-                    *args.create_info = taken.push_next(sync2);
+                    // Chain `synchronization2` on, but only where the device can really have it:
+                    // a feature struct asking for an unsupported feature either fails the create
+                    // or is ignored, and "ignored" is the dangerous one - it would leave the flag
+                    // below claiming a feature nothing enabled.
+                    if sync2_on {
+                        let taken = core::mem::take(args.create_info);
+                        *args.create_info = taken.push_next(sync2);
+                    }
                     if let Ok(mut all) = extensions_writer.lock() {
                         *all = args
                             .extensions
@@ -229,7 +277,7 @@ pub(crate) fn open_shared(
             )
             .inspect_err(|e| log::warn!("gpu-info: shared Vulkan device creation failed: {e}"))
             .ok()?;
-        (video_ext, decode, open)
+        (video_ext, decode, sync2_on, open)
     };
 
     // Read the raw handles BEFORE wgpu takes the device over; they stay valid because wgpu keeps
@@ -250,6 +298,7 @@ pub(crate) fn open_shared(
                 .map(|all| all.clone())
                 .unwrap_or_default(),
             instance_api_version: hal.shared_instance().instance_api_version(),
+            device_api_version: hal.physical_device_capabilities().properties().api_version,
             // wgpu enables timeline semaphores exactly when the adapter supports them
             // (wgpu-hal 30 `vulkan/adapter.rs:381-386`).
             timeline_semaphore: hal
@@ -257,8 +306,15 @@ pub(crate) fn open_shared(
                 .supports_extension(c"VK_KHR_timeline_semaphore")
                 || hal.physical_device_capabilities().properties().api_version
                     >= vk::API_VERSION_1_2,
-            // Enabled by the callback above, because wgpu does not.
-            synchronization2: true,
+            // Enabled by the callback above, because wgpu does not - but only where enabling it
+            // MEANS something. Chaining `PhysicalDeviceSynchronization2Features` onto a device
+            // that supports neither the 1.3 core feature nor `VK_KHR_synchronization2` is not an
+            // error: a driver may ignore a chain entry it does not recognise, `vkCreateDevice`
+            // succeeds, and the flag would then claim a feature nothing enabled. Every `2`-form
+            // barrier a consumer records against such a device is undefined behaviour, on exactly
+            // the machines this office does not own. So the flag is READ BACK from what the
+            // device can do rather than asserted from what was asked for.
+            synchronization2: sync2_on,
             // NOT enabled: wgpu builds the feature struct with the enabling line commented out
             // (wgpu-hal 30 `vulkan/adapter.rs:424`), and this crate cannot add a second struct of
             // the same type to the chain. A consumer that needs Ycbcr sampling must open its own
@@ -303,6 +359,18 @@ pub(crate) fn open_shared(
 }
 
 impl VulkanShared {
+    /// The version whose entry points a consumer may actually call.
+    ///
+    /// The lower of the instance's and the device's: an entry point needs BOTH the instance to
+    /// have been created at that version and the device to implement it. This is the number to
+    /// hand to anything that refuses to run below a version - never
+    /// [`Self::instance_api_version`] alone, which on a 1.3 loader in front of an older driver
+    /// promises functions that are not there.
+    #[must_use]
+    pub fn usable_api_version(&self) -> u32 {
+        self.instance_api_version.min(self.device_api_version)
+    }
+
     /// The decode queue itself, or `None` when this adapter has no decode family.
     ///
     /// Fetched on demand rather than stored: `vkGetDeviceQueue` is a table lookup, and a decoder
@@ -386,14 +454,39 @@ mod tests {
             // What a decoder needs from this device, stated rather than hoped for: it records
             // every barrier in the `2` form and waits on timeline semaphores, and both are core
             // in 1.3 / 1.2 respectively.
+            // The DEVICE's version, not the instance's. A 1.3 loader in front of an older driver
+            // reports 1.3 for the instance while the device has no `vkCmdPipelineBarrier2` - and
+            // ash fills an unloadable slot with a stub that panics at the first call, inside
+            // whichever library made it. `usable_api_version` is the honest answer, so it is what
+            // is pinned; the instance figure alone would have passed on such a machine.
             assert!(
-                vk.instance_api_version >= vk::API_VERSION_1_3,
-                "a decode consumer needs a 1.3 instance, got {:#x}",
-                vk.instance_api_version
+                vk.usable_api_version() >= vk::API_VERSION_1_3,
+                "a decode consumer needs 1.3 on BOTH sides, got instance {:#x} device {:#x}",
+                vk.instance_api_version,
+                vk.device_api_version
+            );
+            assert_eq!(
+                vk.usable_api_version(),
+                vk.instance_api_version.min(vk.device_api_version),
+                "the usable version is the lower of the two, by definition"
+            );
+            // An IMPLICATION, because the claim is what matters: this flag being true must mean
+            // the device can really have the feature. Asserting it flatly would pass on a machine
+            // where the chained struct was silently ignored - which is the bug this replaced.
+            // SAFETY: read-only use of the adapter wgpu already owns.
+            let can_sync2 = unsafe {
+                let hal = shared.adapter.as_hal::<Vulkan>().expect("vulkan adapter");
+                sync2_possible(&hal)
+            };
+            assert_eq!(
+                vk.synchronization2, can_sync2,
+                "synchronization2 must be reported as what the device can actually enable, \
+                 not as what was asked for"
             );
             assert!(
                 vk.synchronization2,
-                "synchronization2 is chained on by this module, because wgpu does not enable it"
+                "a 1.3 device has synchronization2, and a decoder sharing this device records \
+                 every barrier in the `2` form"
             );
             assert!(
                 vk.timeline_semaphore,

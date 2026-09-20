@@ -115,7 +115,8 @@ impl GpuLimits {
     ) -> Self {
         Self::new(
             limits.max_texture_dimension_2d,
-            u64::from(limits.max_storage_buffer_binding_size),
+            // Already `u64` in wgpu 30; it was `u32` when this was written.
+            limits.max_storage_buffer_binding_size,
             total_memory,
             available_memory,
             true,
