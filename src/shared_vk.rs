@@ -686,6 +686,60 @@ mod tests {
         }
     }
 
+    /// Can wgpu itself see a decoded picture's PLANES, or must somebody copy them out?
+    ///
+    /// wgpu 30 has `TextureFormat::NV12` and `P010`, and `wgpu-hal`'s Vulkan backend maps them to
+    /// `G8_B8R8_2PLANE_420_UNORM` and `G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16` (`conv.rs:80`),
+    /// which are exactly the two formats a Vulkan Video decoder produces here. With them, a
+    /// decoded image can be wrapped as a wgpu texture and read through
+    /// `TextureAspect::Plane0`/`Plane1` views (R8Unorm/Rg8Unorm, R16Unorm/Rg16Unorm), so the
+    /// YUV-to-working-space shader a host already owns can read the picture WHERE IT WAS DECODED.
+    ///
+    /// This records what this adapter actually reports, because the whole no-copy path depends on
+    /// it and "wgpu supports the format" is a claim about a build, not about a GPU.
+    #[test]
+    fn what_the_adapter_says_about_planar_video_formats() {
+        let Some(shared) = crate::shared_device() else {
+            eprintln!("no GPU adapter on this machine; nothing to report");
+            return;
+        };
+        // The ADAPTER's answer is "what this GPU could do"; the DEVICE's is "what was actually
+        // enabled". Only the second one decides whether a wrap succeeds at runtime, and they are
+        // different questions - this crate asks for every stable feature the adapter reports, but
+        // that intersection is a fact to read back, not to assume.
+        let can = shared.adapter.features();
+        let have = shared.device.features();
+        let nv12 = (
+            can.contains(wgpu::Features::TEXTURE_FORMAT_NV12),
+            have.contains(wgpu::Features::TEXTURE_FORMAT_NV12),
+        );
+        let p010 = (
+            can.contains(wgpu::Features::TEXTURE_FORMAT_P010),
+            have.contains(wgpu::Features::TEXTURE_FORMAT_P010),
+        );
+        eprintln!(
+            "[planar-formats] {}: NV12 adapter {} device {}, P010 adapter {} device {}",
+            shared.adapter.get_info().name,
+            nv12.0,
+            nv12.1,
+            p010.0,
+            p010.1
+        );
+        // An adapter without these formats is a real configuration and costs a copy, not a
+        // failure - so the assertion is the IMPLICATION, not the capability: whatever the adapter
+        // can do, the shared device must have asked for, because this crate's whole contract is
+        // that one device serves every consumer's fast path.
+        assert_eq!(
+            nv12.0, nv12.1,
+            "the adapter supports NV12 but the shared device did not enable it: a consumer's \
+             zero-copy video path would fail on a device that could have carried it"
+        );
+        assert_eq!(
+            p010.0, p010.1,
+            "the adapter supports P010 but the shared device did not enable it"
+        );
+    }
+
     /// Adopting a hand-built device must not break ordinary wgpu work on it.
     #[test]
     fn the_shared_device_still_computes() {
