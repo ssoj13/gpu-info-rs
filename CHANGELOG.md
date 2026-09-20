@@ -9,6 +9,47 @@ published to crates.io, so consumers pin it by git ref rather than by version.
 
 ### Added
 
+- **`VulkanShared` hands over QUEUES, not families.** `main_queue`, `decode_queue` and the new
+  `compute_queue` are `(family, index)` pairs, because the index is what decides whose queue a
+  handle is: `vkQueueSubmit` is externally synchronised, so a consumer that guessed index `0`
+  could get the one wgpu is already submitting to from another thread. `compute_queue()` and
+  `decode_queue()` fetch the `VkQueue` for their pair.
+- **A compute queue is reserved for the decoder's in-place read.** The video-decode family cannot
+  dispatch compute and the renderer's queue is not ours, so a consumer that wants to read a
+  decoded picture where it lies needs a third queue. Preference: a compute family of its own,
+  then a second queue in wgpu's family (wgpu keeps index 0, so index 1 is free, and the count is
+  raised by replacing that entry's priority slice — one create-info per family is a hard rule,
+  `VUID-VkDeviceCreateInfo-queueFamilyIndex-02802`), then none, said out loud. On an RTX 3080 Ti:
+  wgpu `(0,0)`, decode `(3,0)`, compute `(2,0)`.
+- **`device_api_version` beside `instance_api_version`, and `usable_api_version()` — the lower of
+  the two.** That is the number a consumer must gate on.
+
+### Fixed
+
+- **The published API version was the loader's, not the device's.** wgpu fills
+  `instance_api_version` from `vkEnumerateInstanceVersion` and then pins the application version
+  to 1.3 whenever the loader is 1.1 or better. What decides whether a device entry point exists
+  is the physical device's `apiVersion` — and ash fills an unloadable slot with a stub that
+  PANICS at the first call, inside whichever library made it. A 1.3 loader in front of a 1.2
+  driver would have passed every check and then panicked mid-decode.
+- **`synchronization2` was reported as `true` unconditionally**, because this crate chains the
+  feature struct on. A driver may ignore a chain entry it does not recognise and still create the
+  device, so below 1.3 without `VK_KHR_synchronization2` the flag claimed a feature nothing had
+  enabled — and every `2`-form barrier a decoder records against such a device is undefined
+  behaviour. The struct is now chained only where the feature can exist, the extension is
+  requested when it is the extension that provides it, and the flag is read back from the device.
+- **wgpu's own queue family was inferred** from the first queue create-info through an
+  `AtomicU32`. `Device::queue_family_index()` and `queue_index()` are public in wgpu-hal 30; they
+  are read directly now, and the family wgpu hard-codes is verified rather than assumed — if it
+  ever changes, sharing stops instead of quietly handing over the renderer's queue.
+- **A video-decode family that IS wgpu's family was shared silently.** It is refused now: that is
+  two unsynchronised submitters wearing one handle, and nothing downstream could detect it.
+- **The `synchronization2` feature struct was `Box::leak`ed** once per call. wgpu-hal's callback
+  signature (`CreateDeviceCallback<'this>`, `'this: 'pnext`) lets a local outlive
+  `vkCreateDevice`, so it is a local now.
+- `limits.rs` no longer converts `max_storage_buffer_binding_size` to `u64`; it is already `u64`
+  in wgpu 30.
+
 - **`gpu_info::stats` — live GPU counters cheap enough to poll from a UI frame loop.**
   `stats::query()` returns [`GpuStats`] with device utilisation, GPU-resident memory, total
   addressable memory and a `unified` flag.
