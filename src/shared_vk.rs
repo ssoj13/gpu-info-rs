@@ -77,6 +77,28 @@ pub struct VulkanShared {
     pub decode_queue_family: Option<u32>,
     /// The video extensions actually enabled on the device, in request order.
     pub video_extensions: Vec<&'static CStr>,
+    /// Every device extension enabled at `vkCreateDevice`, not only the video ones.
+    ///
+    /// A consumer that speaks Vulkan needs this whole list, because Vulkan cannot be asked which
+    /// extensions a device was created with, and calling into one that was not enabled is
+    /// undefined behaviour. So the creator of the device has to say.
+    pub device_extensions: Vec<std::ffi::CString>,
+    /// The API version the INSTANCE was created with.
+    ///
+    /// A consumer whose entry points are core in a later version (`vkCmdPipelineBarrier2` is 1.3)
+    /// has to know this rather than assume it: an unloadable function pointer is not an error, it
+    /// is a crash at the first call.
+    pub instance_api_version: u32,
+    /// Whether the three features every compute/decode consumer here needs were enabled.
+    ///
+    /// The device is built with every stable feature the adapter reports, so these are normally
+    /// all true; they are recorded rather than assumed because "normally" is not a contract and
+    /// `vkGetPhysicalDeviceFeatures` answers what the hardware CAN do, not what was enabled.
+    pub timeline_semaphore: bool,
+    /// See [`Self::timeline_semaphore`].
+    pub synchronization2: bool,
+    /// See [`Self::timeline_semaphore`].
+    pub sampler_ycbcr_conversion: bool,
 }
 
 impl core::fmt::Debug for VulkanShared {
@@ -85,6 +107,8 @@ impl core::fmt::Debug for VulkanShared {
             .field("main_queue_family", &self.main_queue_family)
             .field("decode_queue_family", &self.decode_queue_family)
             .field("video_extensions", &self.video_extensions)
+            .field("instance_api_version", &self.instance_api_version)
+            .field("device_extensions", &self.device_extensions.len())
             .finish()
     }
 }
@@ -139,6 +163,22 @@ pub(crate) fn open_shared(
     // is recorded there.
     let main_family = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
     let main_family_writer = std::sync::Arc::clone(&main_family);
+    // The full extension list is recorded the same way, for a consumer that must know exactly
+    // what was enabled (Vulkan cannot be asked afterwards).
+    let all_extensions =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::<std::ffi::CString>::new()));
+    let extensions_writer = std::sync::Arc::clone(&all_extensions);
+
+    // `synchronization2` is NOT enabled by wgpu (wgpu-hal 30 never builds a
+    // `PhysicalDeviceSynchronization2Features`), and a video decoder on this device needs it:
+    // every barrier ffmpeg-rs records is the `2` form. Enabled here, in the one place that builds
+    // this device, instead of left for each consumer to discover as undefined behaviour.
+    //
+    // Leaked on purpose: the structure must outlive this callback, because `vkCreateDevice` reads
+    // the chain after it returns. One small struct, once per process.
+    let sync2: &'static mut vk::PhysicalDeviceSynchronization2Features<'static> = Box::leak(
+        Box::new(vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true)),
+    );
 
     let (video_ext, decode, open) = unsafe {
         let hal = adapter.as_hal::<Vulkan>()?;
@@ -174,6 +214,17 @@ pub(crate) fn open_shared(
                                 .queue_priorities(&PRIORITY),
                         );
                     }
+                    // Chain `synchronization2` on. wgpu never asks for it, and a video decoder
+                    // on this device records every barrier in the `2` form.
+                    let taken = core::mem::take(args.create_info);
+                    *args.create_info = taken.push_next(sync2);
+                    if let Ok(mut all) = extensions_writer.lock() {
+                        *all = args
+                            .extensions
+                            .iter()
+                            .map(|e| std::ffi::CString::from(*e))
+                            .collect();
+                    }
                 })),
             )
             .inspect_err(|e| log::warn!("gpu-info: shared Vulkan device creation failed: {e}"))
@@ -194,6 +245,25 @@ pub(crate) fn open_shared(
             main_queue_family: main_family.load(std::sync::atomic::Ordering::Relaxed),
             decode_queue_family: Some(decode),
             video_extensions: video_ext,
+            device_extensions: all_extensions
+                .lock()
+                .map(|all| all.clone())
+                .unwrap_or_default(),
+            instance_api_version: hal.shared_instance().instance_api_version(),
+            // wgpu enables timeline semaphores exactly when the adapter supports them
+            // (wgpu-hal 30 `vulkan/adapter.rs:381-386`).
+            timeline_semaphore: hal
+                .physical_device_capabilities()
+                .supports_extension(c"VK_KHR_timeline_semaphore")
+                || hal.physical_device_capabilities().properties().api_version
+                    >= vk::API_VERSION_1_2,
+            // Enabled by the callback above, because wgpu does not.
+            synchronization2: true,
+            // NOT enabled: wgpu builds the feature struct with the enabling line commented out
+            // (wgpu-hal 30 `vulkan/adapter.rs:424`), and this crate cannot add a second struct of
+            // the same type to the chain. A consumer that needs Ycbcr sampling must open its own
+            // device - one that reads the planes separately does not.
+            sampler_ycbcr_conversion: false,
         }
     };
 
@@ -312,6 +382,26 @@ mod tests {
                 VIDEO_CORE.iter().all(|e| vk.video_extensions.contains(e)),
                 "the core video extensions must be enabled, got {:?}",
                 vk.video_extensions
+            );
+            // What a decoder needs from this device, stated rather than hoped for: it records
+            // every barrier in the `2` form and waits on timeline semaphores, and both are core
+            // in 1.3 / 1.2 respectively.
+            assert!(
+                vk.instance_api_version >= vk::API_VERSION_1_3,
+                "a decode consumer needs a 1.3 instance, got {:#x}",
+                vk.instance_api_version
+            );
+            assert!(
+                vk.synchronization2,
+                "synchronization2 is chained on by this module, because wgpu does not enable it"
+            );
+            assert!(
+                vk.timeline_semaphore,
+                "a 1.2+ device has timeline semaphores, and wgpu enables them"
+            );
+            assert!(
+                !vk.device_extensions.is_empty(),
+                "the enabled extension list is what a consumer must be told; it cannot be empty"
             );
         } else {
             assert!(
