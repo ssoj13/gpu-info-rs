@@ -50,6 +50,20 @@ const VIDEO_CORE: [&CStr; 2] = [c"VK_KHR_video_queue", c"VK_KHR_video_decode_que
 /// `vkCreateDevice` reads it (the callback returns before the call happens).
 static PRIORITY: [f32; 1] = [1.0];
 
+/// Two priorities, for the case where a compute queue can only be a SECOND queue in wgpu's own
+/// family. The count in `VkDeviceQueueCreateInfo` is the length of this slice, so raising the
+/// count means replacing the slice - bumping the number alone would have the driver read a float
+/// past the end of a one-element array.
+static PRIORITY_PAIR: [f32; 2] = [1.0, 1.0];
+
+/// The queue family wgpu renders on.
+///
+/// wgpu-hal 30 hard-codes it (`vulkan/adapter.rs`, `let family_index = 0; //TODO`) and takes
+/// index 0 of it. A constant rather than a guess, and CHECKED after the device is open against
+/// `Device::queue_family_index()`: if wgpu ever stops doing this, sharing must stop rather than
+/// quietly hand a consumer the renderer's own queue.
+const WGPU_FAMILY: u32 = 0;
+
 /// The raw Vulkan objects behind the shared device, for consumers that speak Vulkan directly.
 ///
 /// Every handle here belongs to the SAME logical device wgpu is using. None of them is owned by
@@ -68,13 +82,26 @@ pub struct VulkanShared {
     pub physical_device: vk::PhysicalDevice,
     /// The logical device wgpu is using. Do NOT destroy it.
     pub device: ash::Device,
-    /// The queue family wgpu's own queue belongs to.
-    pub main_queue_family: u32,
-    /// A queue family that can `vkCmdDecodeVideoKHR`, when the device was created with one.
+    /// The `(family, index)` pair wgpu's OWN queue is, read from wgpu rather than inferred.
     ///
-    /// `None` means the adapter has no video-decode queue: a decoder must then open its own
-    /// device, and every frame it produces has to be copied through host memory.
-    pub decode_queue_family: Option<u32>,
+    /// A consumer must never submit to it. `vkQueueSubmit` is externally synchronised, and this
+    /// queue already has a submitter - the renderer - on another thread.
+    pub main_queue: (u32, u32),
+    /// A `(family, index)` that can `vkCmdDecodeVideoKHR`, when the device was created with one.
+    ///
+    /// `None` means the adapter has no video-decode queue of its own: a decoder must then open
+    /// its own device, and every frame it produces has to be copied through host memory.
+    ///
+    /// The index is part of the answer, not an assumption. A consumer that guessed `0` would
+    /// submit into whichever queue happened to be first in the family - possibly the renderer's.
+    pub decode_queue: Option<(u32, u32)>,
+    /// A `(family, index)` a consumer may run COMPUTE on, distinct from [`Self::main_queue`].
+    ///
+    /// This is what lets a decoder read a decoded picture in place instead of copying it: the
+    /// video-decode family cannot dispatch compute, and the renderer's queue is not ours to
+    /// submit to. `None` means no such queue could be reserved, and a consumer must say so rather
+    /// than fall back to somebody else's queue.
+    pub compute_queue: Option<(u32, u32)>,
     /// The video extensions actually enabled on the device, in request order.
     pub video_extensions: Vec<&'static CStr>,
     /// Every device extension enabled at `vkCreateDevice`, not only the video ones.
@@ -113,10 +140,12 @@ pub struct VulkanShared {
 impl core::fmt::Debug for VulkanShared {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("VulkanShared")
-            .field("main_queue_family", &self.main_queue_family)
-            .field("decode_queue_family", &self.decode_queue_family)
+            .field("main_queue", &self.main_queue)
+            .field("decode_queue", &self.decode_queue)
+            .field("compute_queue", &self.compute_queue)
             .field("video_extensions", &self.video_extensions)
             .field("instance_api_version", &self.instance_api_version)
+            .field("device_api_version", &self.device_api_version)
             .field("device_extensions", &self.device_extensions.len())
             .finish()
     }
@@ -156,6 +185,50 @@ fn sync2_needs_extension(adapter: &wgpu::hal::vulkan::Adapter) -> bool {
         && caps.supports_extension(c"VK_KHR_synchronization2")
 }
 
+/// Every queue family's flags and queue count, in index order.
+fn families(adapter: &wgpu::hal::vulkan::Adapter) -> Vec<vk::QueueFamilyProperties> {
+    // SAFETY: the physical device and instance belong to this adapter and outlive the call.
+    unsafe {
+        adapter
+            .shared_instance()
+            .raw_instance()
+            .get_physical_device_queue_family_properties(adapter.raw_physical_device())
+    }
+}
+
+/// A family a CONSUMER may dispatch compute on, given the families already spoken for.
+///
+/// Preference order, and the reason for it:
+/// 1. a family with COMPUTE and no GRAPHICS that is neither wgpu's nor the decoder's - a queue
+///    nobody else submits to, which is the only arrangement with no contention at all;
+/// 2. any other COMPUTE family that is not wgpu's and not the decode family;
+/// 3. nothing - and the caller says so rather than handing over a queue somebody else owns.
+///
+/// The decode family is excluded deliberately even when it reports COMPUTE: two roles on one
+/// queue are two unsynchronised submitters, and a decoder that also ran its passes there would
+/// serialise its own decoding behind them.
+fn compute_family(
+    families: &[vk::QueueFamilyProperties],
+    main: u32,
+    decode: Option<u32>,
+) -> Option<u32> {
+    let usable = |i: usize, f: &vk::QueueFamilyProperties| {
+        let idx = u32::try_from(i).ok()?;
+        (f.queue_flags.contains(vk::QueueFlags::COMPUTE)
+            && idx != main
+            && Some(idx) != decode
+            && f.queue_count > 0)
+            .then_some(idx)
+    };
+    families
+        .iter()
+        .enumerate()
+        .find_map(|(i, f)| {
+            usable(i, f).filter(|_| !f.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+        })
+        .or_else(|| families.iter().enumerate().find_map(|(i, f)| usable(i, f)))
+}
+
 /// The first queue family that can decode video, if any.
 fn decode_family(adapter: &wgpu::hal::vulkan::Adapter) -> Option<u32> {
     // SAFETY: the physical device and instance belong to this adapter and outlive the call.
@@ -188,13 +261,10 @@ pub(crate) fn open_shared(
     // SAFETY (both blocks): `as_hal` yields the adapter wgpu is already using; we only read from
     // it, and the guard is dropped before the device is adopted. `open_with_callback`'s contract
     // is that the callback may add, never remove - which is what the closure below does.
-    // wgpu's own queue family is not readable from the hal device (the field is private), and it
-    // is not ours to assume: the callback is the one place where the real list is in hand, so it
-    // is recorded there.
-    let main_family = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
-    let main_family_writer = std::sync::Arc::clone(&main_family);
-    // The full extension list is recorded the same way, for a consumer that must know exactly
-    // what was enabled (Vulkan cannot be asked afterwards).
+    //
+    // The full enabled-extension list is recorded from inside the callback, because Vulkan cannot
+    // be asked afterwards which extensions a device was created with, and a consumer that calls
+    // into one that was not enabled is in undefined behaviour.
     let all_extensions =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::<std::ffi::CString>::new()));
     let extensions_writer = std::sync::Arc::clone(&all_extensions);
@@ -204,13 +274,14 @@ pub(crate) fn open_shared(
     // every barrier ffmpeg-rs records is the `2` form. Enabled here, in the one place that builds
     // this device, instead of left for each consumer to discover as undefined behaviour.
     //
-    // Leaked on purpose: the structure must outlive this callback, because `vkCreateDevice` reads
-    // the chain after it returns. One small struct, once per process.
-    let sync2: &'static mut vk::PhysicalDeviceSynchronization2Features<'static> = Box::leak(
-        Box::new(vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true)),
-    );
+    // A local, borrowed by the callback - NOT leaked. `vkCreateDevice` reads the chain after the
+    // callback returns, so the struct must outlive the callback, and it does: wgpu-hal's signature
+    // is `CreateDeviceCallback<'this>` with `'this: 'pnext`, so anything living for this function
+    // is long-lived enough. It used to be `Box::leak`ed, which leaked once per call for nothing.
+    let mut sync2 = vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+    let sync2_ref = &mut sync2;
 
-    let (video_ext, decode, sync2_on, open) = unsafe {
+    let (video_ext, decode, compute, sync2_on, open) = unsafe {
         let hal = adapter.as_hal::<Vulkan>()?;
         let video_ext = present_video_ext(&hal);
         if !VIDEO_CORE.iter().all(|e| video_ext.contains(e)) {
@@ -218,6 +289,40 @@ pub(crate) fn open_shared(
             return None;
         }
         let decode = decode_family(&hal)?;
+        // wgpu's family and queue index, read from wgpu rather than inferred from the callback's
+        // first create-info: `queue_family_index()`/`queue_index()` are public on wgpu-hal 30's
+        // Vulkan device and are the authoritative pair. wgpu hard-codes family 0 today
+        // (`adapter.rs`, `let family_index = 0; //TODO`), which is exactly the kind of fact that
+        // must be read rather than assumed.
+        let queue_families = families(&hal);
+        // A decode queue that IS the renderer's queue is not a shared device, it is two
+        // unsynchronised submitters wearing one handle. Refuse, loudly, rather than hand it over:
+        // `vkQueueSubmit` is externally synchronised and nothing downstream could detect this.
+        if decode == WGPU_FAMILY {
+            log::warn!(
+                "gpu-info: the only video-decode family ({decode}) is the one wgpu renders on; \
+                 not sharing this device, because a decoder and the renderer would submit to one \
+                 queue from two threads"
+            );
+            return None;
+        }
+        // A compute queue for whoever reads a decoded picture in place. A family of its own is
+        // best; failing that, a SECOND queue in wgpu's family, which is ours because wgpu keeps
+        // index 0; failing that, none - and a consumer is told so rather than handed the
+        // renderer's queue.
+        let compute = match compute_family(&queue_families, WGPU_FAMILY, Some(decode)) {
+            Some(f) => Some((f, 0)),
+            None => queue_families
+                .get(WGPU_FAMILY as usize)
+                .filter(|f| f.queue_count >= 2)
+                .map(|_| (WGPU_FAMILY, 1)),
+        };
+        if compute.is_none() {
+            log::warn!(
+                "gpu-info: no compute queue could be reserved beside wgpu's; a consumer that \
+                 wanted to read a decoded picture in place will have to copy it instead"
+            );
+        }
         // Whether the feature can be enabled at all, and whether enabling it also means asking
         // for the extension. Decided HERE, where the adapter is in hand, because the callback
         // below cannot query it.
@@ -233,6 +338,11 @@ pub(crate) fn open_shared(
         if sync2_ext {
             extra.push(c"VK_KHR_synchronization2");
         }
+        // Where a compute queue has to be a SECOND queue in wgpu's own family, the count is
+        // raised by replacing that entry's priority slice - one entry per family is a hard rule
+        // (VUID-VkDeviceCreateInfo-queueFamilyIndex-02802), so a second create-info for the same
+        // family would be invalid usage rather than a second queue.
+        let pair_in_main = compute == Some((WGPU_FAMILY, 1));
         let open = hal
             .open_with_callback(
                 features,
@@ -240,23 +350,32 @@ pub(crate) fn open_shared(
                 &wgpu::MemoryHints::Performance,
                 Some(Box::new(move |args| {
                     args.extensions.extend_from_slice(&extra);
-                    if let Some(first) = args.queue_create_infos.first() {
-                        main_family_writer.store(
-                            first.queue_family_index,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
+                    // wgpu asks for its own family only; the decoder needs a queue of its own,
+                    // and so does anything that reads a decoded picture with a compute shader.
+                    let mut want = |family: u32| {
+                        if !args
+                            .queue_create_infos
+                            .iter()
+                            .any(|q| q.queue_family_index == family)
+                        {
+                            args.queue_create_infos.push(
+                                vk::DeviceQueueCreateInfo::default()
+                                    .queue_family_index(family)
+                                    .queue_priorities(&PRIORITY),
+                            );
+                        }
+                    };
+                    want(decode);
+                    if let Some((family, _)) = compute.filter(|(f, _)| *f != WGPU_FAMILY) {
+                        want(family);
                     }
-                    // wgpu asks for its own family only; the decoder needs a queue of its own.
-                    if !args
-                        .queue_create_infos
-                        .iter()
-                        .any(|q| q.queue_family_index == decode)
-                    {
-                        args.queue_create_infos.push(
-                            vk::DeviceQueueCreateInfo::default()
-                                .queue_family_index(decode)
-                                .queue_priorities(&PRIORITY),
-                        );
+                    if pair_in_main {
+                        // wgpu keeps index 0 of this entry (it passes its own pre-callback copy
+                        // of the family index and the literal 0 to `device_from_raw`), so index 1
+                        // is ours.
+                        if let Some(first) = args.queue_create_infos.first_mut() {
+                            *first = first.queue_priorities(&PRIORITY_PAIR);
+                        }
                     }
                     // Chain `synchronization2` on, but only where the device can really have it:
                     // a feature struct asking for an unsupported feature either fails the create
@@ -264,7 +383,7 @@ pub(crate) fn open_shared(
                     // below claiming a feature nothing enabled.
                     if sync2_on {
                         let taken = core::mem::take(args.create_info);
-                        *args.create_info = taken.push_next(sync2);
+                        *args.create_info = taken.push_next(sync2_ref);
                     }
                     if let Ok(mut all) = extensions_writer.lock() {
                         *all = args
@@ -277,8 +396,22 @@ pub(crate) fn open_shared(
             )
             .inspect_err(|e| log::warn!("gpu-info: shared Vulkan device creation failed: {e}"))
             .ok()?;
-        (video_ext, decode, sync2_on, open)
+        (video_ext, decode, compute, sync2_on, open)
     };
+
+    // The assumption above, verified. `queue_family_index()`/`queue_index()` are public on
+    // wgpu-hal 30's Vulkan device, so this is wgpu's own answer rather than an inference from the
+    // create-infos - and a mismatch means every family decision above was made against the wrong
+    // renderer queue.
+    let main_queue = (open.device.queue_family_index(), open.device.queue_index());
+    if main_queue.0 != WGPU_FAMILY {
+        log::warn!(
+            "gpu-info: wgpu renders on family {} rather than {WGPU_FAMILY}; not sharing this \
+             device, because the decode and compute queues were chosen against the wrong one",
+            main_queue.0
+        );
+        return None;
+    }
 
     // Read the raw handles BEFORE wgpu takes the device over; they stay valid because wgpu keeps
     // the device alive for the life of the process.
@@ -290,8 +423,9 @@ pub(crate) fn open_shared(
             instance: hal.shared_instance().raw_instance().clone(),
             physical_device: hal.raw_physical_device(),
             device: open.device.raw_device().clone(),
-            main_queue_family: main_family.load(std::sync::atomic::Ordering::Relaxed),
-            decode_queue_family: Some(decode),
+            main_queue,
+            decode_queue: Some((decode, 0)),
+            compute_queue: compute,
             video_extensions: video_ext,
             device_extensions: all_extensions
                 .lock()
@@ -342,17 +476,12 @@ pub(crate) fn open_shared(
     .inspect_err(|e| log::warn!("gpu-info: wgpu refused the shared Vulkan device: {e}"))
     .ok()?;
 
-    if raw.main_queue_family == u32::MAX {
-        // The callback runs before vkCreateDevice on every path in wgpu-hal 30; if that ever
-        // changes, a wrong family index would be a silently mis-shared image, so refuse instead.
-        log::warn!("gpu-info: wgpu's queue family was never reported; not sharing the device");
-        return None;
-    }
-
     log::info!(
-        "gpu-info: shared Vulkan device: main queue family {}, decode family {}, video extensions {:?}",
-        raw.main_queue_family,
-        decode,
+        "gpu-info: shared Vulkan device: wgpu on {:?}, decode on {:?}, compute on {:?}, \
+         video extensions {:?}",
+        raw.main_queue,
+        raw.decode_queue,
+        raw.compute_queue,
         raw.video_extensions
     );
     Some((device, queue, raw))
@@ -377,9 +506,20 @@ impl VulkanShared {
     /// that wants the queue usually wants it once, at session setup.
     #[must_use]
     pub fn decode_queue(&self) -> Option<vk::Queue> {
-        let family = self.decode_queue_family?;
-        // SAFETY: `family` was passed to `vkCreateDevice` with one queue, so index 0 exists.
-        Some(unsafe { self.device.get_device_queue(family, 0) })
+        let (family, index) = self.decode_queue?;
+        // SAFETY: the pair was passed to `vkCreateDevice`, so the queue exists.
+        Some(unsafe { self.device.get_device_queue(family, index) })
+    }
+
+    /// The compute queue a consumer may submit to, or `None` when none was reserved.
+    ///
+    /// Never wgpu's own: [`Self::main_queue`] has a submitter already, and `vkQueueSubmit` is
+    /// externally synchronised.
+    #[must_use]
+    pub fn compute_queue(&self) -> Option<vk::Queue> {
+        let (family, index) = self.compute_queue?;
+        // SAFETY: the pair was passed to `vkCreateDevice`, so the queue exists.
+        Some(unsafe { self.device.get_device_queue(family, index) })
     }
 }
 
@@ -428,23 +568,65 @@ mod tests {
                 .vulkan
                 .as_ref()
                 .expect("adapter can decode video, so the shared device must carry it");
-            assert!(
-                vk.decode_queue_family.is_some(),
-                "a shared Vulkan half without a decode family is useless"
-            );
+            let decode = vk
+                .decode_queue
+                .expect("a shared Vulkan half without a decode queue is useless");
             assert!(
                 vk.decode_queue().is_some(),
                 "decode queue must be fetchable"
             );
-            assert_ne!(
-                vk.main_queue_family,
-                u32::MAX,
-                "wgpu's queue family was not recorded"
+            // The pair wgpu itself reports, not one inferred from the create-infos.
+            // SAFETY: read-only use of the adapter wgpu already owns.
+            let wgpu_pair = unsafe {
+                let hal = shared.device.as_hal::<Vulkan>().expect("vulkan device");
+                (hal.queue_family_index(), hal.queue_index())
+            };
+            assert_eq!(
+                vk.main_queue, wgpu_pair,
+                "the published main queue must be the one wgpu actually renders on"
             );
+            // THE rule this whole struct exists to keep: no consumer queue may be wgpu's own.
+            // `vkQueueSubmit` is externally synchronised, so sharing that handle with a decoder
+            // on another thread is a data race nothing downstream could detect.
             assert_ne!(
-                Some(vk.main_queue_family),
-                vk.decode_queue_family,
-                "the decode queue must be its own family, or the decoder blocks wgpu's queue"
+                decode, vk.main_queue,
+                "the decode queue must not be the queue wgpu renders on"
+            );
+            if let Some(compute) = vk.compute_queue {
+                assert_ne!(
+                    compute, vk.main_queue,
+                    "the compute queue must not be the queue wgpu renders on"
+                );
+                assert_ne!(
+                    compute, decode,
+                    "the compute queue must not be the decode queue: the decode family cannot \
+                     dispatch compute, and two roles on one queue are two submitters"
+                );
+                assert!(
+                    vk.compute_queue().is_some(),
+                    "a published compute pair must be fetchable"
+                );
+            }
+            // On any adapter with a compute family of its own - every discrete GPU - one must
+            // have been reserved, because without it a consumer cannot read a decoded picture in
+            // place and is forced back into copying the frame.
+            // SAFETY: read-only use of the adapter wgpu already owns.
+            let has_other_compute = unsafe {
+                let hal = shared.adapter.as_hal::<Vulkan>().expect("vulkan adapter");
+                compute_family(&families(&hal), vk.main_queue.0, Some(decode.0)).is_some()
+            };
+            if has_other_compute {
+                assert!(
+                    vk.compute_queue.is_some(),
+                    "this adapter has a compute family beside wgpu's and the decoder's, so a \
+                     compute queue must have been reserved"
+                );
+            }
+            // Printed because "which queue went where" is the whole contract, and a green test
+            // that never shows it leaves the reader to trust the assertions blind.
+            eprintln!(
+                "[shared-vk] wgpu {:?}, decode {:?}, compute {:?} on {}",
+                vk.main_queue, vk.decode_queue, vk.compute_queue, info.name
             );
             assert!(
                 VIDEO_CORE.iter().all(|e| vk.video_extensions.contains(e)),
