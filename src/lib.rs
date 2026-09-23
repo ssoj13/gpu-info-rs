@@ -36,6 +36,11 @@
 pub mod image;
 #[cfg(feature = "wgpu")]
 mod model;
+/// Pins the module containing this crate before [`shared_device`] creates process-lifetime state
+/// in it (see the module docs: an unloaded plug-in must not leave the device's threads running
+/// unmapped code).
+#[cfg(feature = "wgpu")]
+mod pin;
 /// The shared device as raw Vulkan: video extensions, a decode queue, and the `ash` handles a
 /// hardware decoder needs to run on the SAME device wgpu computes on.
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
@@ -281,12 +286,36 @@ static SHARED: std::sync::OnceLock<Option<SharedGpu>> = std::sync::OnceLock::new
 /// the caller flips an `unsafe { ExperimentalFeatures::enabled() }` opt-in, and requesting them
 /// would make the whole negotiation fail with "experimental features are not enabled".
 ///
-/// Returns `None` (cached) when no adapter is available or device creation fails — never panics.
+/// **The module containing this crate is pinned first** (never unmapped for the rest of the
+/// process). The shared device is process-lifetime state: it lives in a `static` that is never
+/// dropped, and wgpu runs threads for it. Inside a dynamically loaded module (an OpenFX plug-in,
+/// for example) that the host later unloads, those threads executed unmapped code (an access
+/// violation) and every reload leaked a whole device. Pinning keeps the code mapped and makes later
+/// loads reuse the image, so the negotiation stays ONE per process; the host's unload still runs
+/// the plug-in's own unload actions. In an executable the pin is a no-op.
+///
+/// Returns `None` (cached) when the module cannot be pinned, when no adapter is available or when
+/// device creation fails — never panics. A pin failure is logged as an error with its reason:
+/// no device is created in a module that could be unmapped under it.
 /// [`OnceLock::get_or_init`] collapses concurrent first callers into ONE negotiation.
 #[cfg(feature = "wgpu")]
 pub fn shared_device() -> Option<&'static SharedGpu> {
     SHARED
         .get_or_init(|| {
+            if let Err(error) = pin::pin_containing_module() {
+                log::error!(
+                    "gpu-info: no shared device: the module that would own it cannot be pinned \
+                     ({error}); unloading it would leave the device's threads running unmapped code"
+                );
+                return None;
+            }
+            // TODO(gl-backend): the default backends include GL. On Windows its WGL instance
+            // spawns a thread ("wgpu-hal WGL Instance Thread") that owns a hidden window and parks
+            // for the instance's lifetime, although the shared device is Vulkan/DX12/Metal. It was
+            // the thread that crashed in an unloaded OpenFX plug-in (now prevented by the pin
+            // above). Dropping GL from this instance (Backends::PRIMARY) would remove the thread and
+            // speed up negotiation, but changes which adapters `query`-style consumers of the same
+            // instance can see; a separate decision (CHANGELOG, Unreleased, Known issues).
             let instance =
                 wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
             // HighPerformance + no fallback: adopt the real discrete GPU, not a software rasterizer.

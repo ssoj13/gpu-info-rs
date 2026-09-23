@@ -14,6 +14,16 @@ name = "gpu-info"
 path = "src/bin/wgpu-info.rs"
 required-features = ["cli"]
 
+# Unload regression (tests/unload_regression.rs): a cdylib fixture that negotiates the shared
+# device, and the probe that loads and unloads it and counts what each cycle leaves behind.
+[[example]]
+name = "unload_probe_dll"
+crate-type = ["cdylib"]
+required-features = ["wgpu"]
+
+[[example]]
+name = "unload_probe"
+
 [features]
 default = ["cli", "wgpu"]
 
@@ -78,6 +88,12 @@ windows = { version = "0.62", features = [
 # boundary, it would be two incompatible `ash::Device`s in one process.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ash = { version = "0.38", default-features = false, features = ["std", "loaded"] }
+
+# Unix: `dladdr` + `dlopen(RTLD_NOLOAD | RTLD_NODELETE)` pin the module that owns the shared
+# device (`src/pin.rs`), so an unloaded plug-in cannot leave the device's threads running unmapped
+# code. Windows pins through the `windows` crate's LibraryLoader above.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # macOS: Metal MTLDevice via wgpu Device::as_hal (objc2, same types as wgpu-hal 30).
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -1,5 +1,17 @@
 # Integrating `gpu-info-rs` — guide for LLM coding agents
 
+## `shared_device()` pins its module (plug-ins, 2026-09-23)
+
+The shared device is process-lifetime state: a `static` that is never dropped, plus the threads
+wgpu runs for it. Before negotiating, `shared_device()` therefore pins the module that contains this
+crate (`src/pin.rs`). For a plug-in DLL/.so this means: once it has used the shared device, the
+host's `FreeLibrary`/`dlclose` no longer unmaps it. Every plug-in-level unload action still runs;
+later loads reuse the same image and the same ONE device. Without the pin, an unloaded plug-in left
+wgpu's threads running unmapped code (access violation) and leaked a whole device per reload. A
+module that cannot be pinned gets `None`, with the reason logged as an error. Do not work around
+this by creating your own device in a plug-in; that device would leak the same way. Regression:
+`cargo test --test unload_regression -- --ignored` (Windows, GPU).
+
 ## ONE device, and it can decode video (2026-09-19)
 
 `shared_device()` no longer just calls `request_device`. On a Vulkan adapter it builds the logical

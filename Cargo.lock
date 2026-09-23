@@ -343,6 +343,7 @@ dependencies = [
  "bytemuck",
  "clap",
  "half",
+ "libc",
  "log",
  "objc2",
  "objc2-metal",

@@ -7,6 +7,34 @@ published to crates.io, so consumers pin it by git ref rather than by version.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`shared_device()` pins the module that contains it before negotiating.** The shared device is
+  process-lifetime state: a `static` that is never dropped, plus the threads wgpu runs for it. Linked
+  into a dynamically loaded module (an OpenFX plug-in) that the host later unloaded, that state
+  outlived its code. An OpenFX host crashed with `0xC0000005` at
+  `<Unloaded_ofx_example_fractal.dll>+0xb9ef01` = `std::thread::Thread::park+0x71` on the thread
+  "wgpu-hal WGL Instance Thread", which parks inside wgpu code for its instance's lifetime and
+  returned into the unmapped image when it woke. Every reload also negotiated a new device in a new
+  copy of the `static`: measured +230 MB private memory and +57 handles per load/unload cycle, and
+  an OFX loaded-test process reached 20 GB and 4,409 handles. Now `GetModuleHandleExW(FROM_ADDRESS |
+  PIN)` on Windows, and `dladdr` + `dlopen(RTLD_NOW | RTLD_NOLOAD | RTLD_NODELETE)` on Unix, keep the
+  image mapped; later loads reuse it, so the negotiation stays ONE per process. A module that cannot
+  be pinned gets no device (`None`, error logged with the reason). In an executable the pin is a
+  no-op.
+- Regression: `tests/unload_regression.rs` (ignored: needs a GPU, Windows) builds the
+  `unload_probe_dll` cdylib fixture and the `unload_probe` example, which loads, negotiates and
+  unloads the fixture 6 times. It requires the image to stay mapped, exactly one live thread starting
+  inside it per cycle, and flat private memory and handles. Before the fix: the image unmapped every
+  cycle, threads accumulated, and +1,190 MB / +386 handles over 6 cycles. After: 304 MB / 435 handles
+  in every cycle.
+
+### Known issues
+
+See `TODO.md`: the GL backend's WGL thread (a separate decision), and two pre-existing gates
+(macOS `cargo check` of `shared_vk`, strict rustdoc links), both present at `8035f5a` before this
+change.
+
 ### Added
 
 - **`VulkanShared` hands over QUEUES, not families.** `main_queue`, `decode_queue` and the new
