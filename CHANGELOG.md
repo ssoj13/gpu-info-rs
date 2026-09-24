@@ -7,6 +7,20 @@ published to crates.io, so consumers pin it by git ref rather than by version.
 
 ## [Unreleased]
 
+### Changed
+
+- **`shared_device()` honours wgpu's instance-level environment variables.** Its instance now comes
+  from `shared_instance_descriptor()` = `InstanceDescriptor::new_without_display_handle_from_env()`,
+  so `WGPU_BACKEND` (e.g. `dx12`, `vulkan`) selects the shared device's backend for the whole process,
+  and the `InstanceFlags` and backend-option variables (`WGPU_VALIDATION`, `WGPU_DX12_COMPILER`, ...)
+  apply. With none set the descriptor equals the previous one. The adapter request stays
+  high-performance, non-fallback (`WGPU_POWER_PREF` / `WGPU_ADAPTER_NAME` are not read). Needed to
+  run one consumer's GPU parity checks on DX12 as well as Vulkan. Regression:
+  `tests/backend_env.rs` (ignored: needs a GPU) runs its own binary as children with
+  `WGPU_BACKEND=dx12` and `=vulkan` and requires that backend (a backend without an adapter is
+  reported SKIPPED); before the change the DX12 child got Vulkan. A unit test checks that without
+  the variable the backend set is unchanged.
+
 ### Fixed
 
 - **`shared_device()` pins the module that contains it before negotiating.** The shared device is

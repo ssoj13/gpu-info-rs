@@ -266,6 +266,15 @@ pub struct SharedGpu {
 #[cfg(feature = "wgpu")]
 static SHARED: std::sync::OnceLock<Option<SharedGpu>> = std::sync::OnceLock::new();
 
+/// The instance descriptor of [`shared_device`]: wgpu's defaults without a display handle, then
+/// every instance-level wgpu environment variable (`InstanceDescriptor::with_env`), so
+/// `WGPU_BACKEND` selects the shared device's backend for the process. With no such variable set it
+/// equals `InstanceDescriptor::new_without_display_handle()`.
+#[cfg(feature = "wgpu")]
+pub fn shared_instance_descriptor() -> wgpu::InstanceDescriptor {
+    wgpu::InstanceDescriptor::new_without_display_handle_from_env()
+}
+
 /// Borrow the process-wide shared GPU context, negotiating it EXACTLY ONCE.
 ///
 /// This is THE single `Instance` / `request_adapter` / `request_device` negotiation for the whole
@@ -298,6 +307,16 @@ static SHARED: std::sync::OnceLock<Option<SharedGpu>> = std::sync::OnceLock::new
 /// device creation fails — never panics. A pin failure is logged as an error with its reason:
 /// no device is created in a module that could be unmapped under it.
 /// [`OnceLock::get_or_init`] collapses concurrent first callers into ONE negotiation.
+///
+/// **The instance honours wgpu's instance-level environment variables**
+/// ([`shared_instance_descriptor`]), read once, at the first call: `WGPU_BACKEND` (for example
+/// `dx12` or `vulkan`) selects the backends the shared device may come from for the whole process;
+/// the [`wgpu::InstanceFlags`] variables (`WGPU_DEBUG`, `WGPU_VALIDATION`,
+/// `WGPU_GPU_BASED_VALIDATION`, `WGPU_VALIDATION_INDIRECT_CALL`, `WGPU_DISCARD_HAL_LABELS`,
+/// `WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER`, `WGPU_STRICT_WEBGPU_COMPLIANCE`) and the backend
+/// options (`WGPU_DX12_COMPILER`, `WGPU_DX12_*`, `WGPU_GLES_MINOR_VERSION`, `WGPU_GL_*`,
+/// `WGPU_NOOP_BACKEND`) apply too. Unset variables change nothing. The adapter choice stays
+/// high-performance, non-fallback: `WGPU_POWER_PREF` and `WGPU_ADAPTER_NAME` are not read.
 #[cfg(feature = "wgpu")]
 pub fn shared_device() -> Option<&'static SharedGpu> {
     SHARED
@@ -316,8 +335,7 @@ pub fn shared_device() -> Option<&'static SharedGpu> {
             // above). Dropping GL from this instance (Backends::PRIMARY) would remove the thread and
             // speed up negotiation, but changes which adapters `query`-style consumers of the same
             // instance can see; a separate decision (CHANGELOG, Unreleased, Known issues).
-            let instance =
-                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let instance = wgpu::Instance::new(shared_instance_descriptor());
             // HighPerformance + no fallback: adopt the real discrete GPU, not a software rasterizer.
             let adapter =
                 pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -469,6 +487,20 @@ mod tests {
         assert!(
             std::ptr::eq(a, b),
             "shared_device() returned two distinct contexts — negotiation ran more than once"
+        );
+    }
+
+    /// Without `WGPU_BACKEND` the shared instance keeps wgpu's default backend set. A process
+    /// that sets the variable cannot check that: the test says so and checks nothing.
+    #[test]
+    fn shared_instance_descriptor_without_env_keeps_the_default_backends() {
+        if let Some(value) = std::env::var_os("WGPU_BACKEND") {
+            println!("SKIPPED: WGPU_BACKEND={value:?} is set in this test process");
+            return;
+        }
+        assert_eq!(
+            shared_instance_descriptor().backends,
+            wgpu::InstanceDescriptor::new_without_display_handle().backends
         );
     }
 
