@@ -1,5 +1,14 @@
 # Integrating `gpu-info-rs` — guide for LLM coding agents
 
+## Read results back with `map_read` (2026-09-25)
+
+`gpu_info::map_read(&device, &buffer.slice(..))` is the one readback wait: map for read, poll
+`wait_indefinitely`, wait for the callback; `Err(ReadbackError::{Poll, Map, Dropped})` means
+nothing is mapped. Do not write your own `map_async` + `mpsc` wait: plug-in code runs on host
+threads, and a blocking channel receive (or `thread::park`) reaches `std::thread::current()`, which
+on glibc pins the plug-in image to that thread. Drive other wgpu futures (error-scope pops) with
+`gpu_info::block_on`. With error scopes: `map_read`, pop the scopes, then check the map result.
+
 ## `shared_device()` pins its module (plug-ins, 2026-09-23)
 
 The shared device is process-lifetime state: a `static` that is never dropped, plus the threads

@@ -41,6 +41,10 @@ mod model;
 /// unmapped code).
 #[cfg(feature = "wgpu")]
 mod pin;
+/// The one blocking buffer-readback wait ([`map_read`]) and future driver ([`block_on`]) that
+/// plug-ins may run on host threads.
+#[cfg(feature = "wgpu")]
+pub mod readback;
 /// The shared device as raw Vulkan: video extensions, a decode queue, and the `ash` handles a
 /// hardware decoder needs to run on the SAME device wgpu computes on.
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
@@ -77,6 +81,8 @@ pub use limits::{GpuLimits, TilingReason};
 pub use image::{GpuImage, GpuImageError};
 #[cfg(feature = "wgpu")]
 pub use model::{AdapterReport, DownlevelReport, GpuReport, TextureFormatReport};
+#[cfg(feature = "wgpu")]
+pub use readback::{ReadbackError, block_on, map_read};
 #[cfg(feature = "wgpu")]
 pub use vram::{
     GpuVramContext, VramInfo, VramQuerier, vram_budget_bytes, vram_budget_from_context,

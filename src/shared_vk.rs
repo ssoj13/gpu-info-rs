@@ -801,10 +801,7 @@ mod tests {
         }
         enc.copy_buffer_to_buffer(&buf, 0, &readback, 0, bytes);
         queue.submit([enc.finish()]);
-        readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("poll");
+        crate::map_read(device, &readback.slice(..)).expect("map");
         let view = readback.slice(..).get_mapped_range().expect("map");
         let got: &[f32] = bytemuck::cast_slice(&view);
         assert!(

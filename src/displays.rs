@@ -25,17 +25,22 @@ fn platform() -> Vec<DisplayProfile> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
     use windows::Win32::Graphics::Gdi::{
-        CreateDCW, DISPLAY_DEVICE_ACTIVE, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICEW, DeleteDC,
-        EnumDisplayDevicesW,
+        CreateDCW, DISPLAY_DEVICE_ACTIVE, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICEW,
+        DeleteDC, EnumDisplayDevicesW,
     };
     use windows::Win32::UI::ColorSystem::GetICMProfileW;
     use windows::core::{PCWSTR, PWSTR};
 
     fn wide(w: &[u16]) -> String {
         let len = w.iter().position(|&c| c == 0).unwrap_or(w.len());
-        OsString::from_wide(&w[..len]).to_string_lossy().into_owned()
+        OsString::from_wide(&w[..len])
+            .to_string_lossy()
+            .into_owned()
     }
-    let new_device = || DISPLAY_DEVICEW { cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32, ..Default::default() };
+    let new_device = || DISPLAY_DEVICEW {
+        cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+        ..Default::default()
+    };
 
     let mut out = Vec::new();
     for n in 0.. {
@@ -70,7 +75,11 @@ fn platform() -> Vec<DisplayProfile> {
             // "\\.\DISPLAY1" -> "DISPLAY1, <monitor>", as OCIO names it.
             let adapter_name = wide(&adapter.DeviceName);
             out.push(DisplayProfile {
-                name: format!("{}, {}", adapter_name.trim_start_matches("\\\\.\\"), wide(&monitor.DeviceString)),
+                name: format!(
+                    "{}, {}",
+                    adapter_name.trim_start_matches("\\\\.\\"),
+                    wide(&monitor.DeviceString)
+                ),
                 icc_path: PathBuf::from(wide(&path)),
             });
         }
@@ -188,7 +197,10 @@ mod tests {
     #[test]
     fn listed_displays_have_names_and_profiles() {
         for d in icc_profiles() {
-            assert!(!d.name.is_empty() && !d.icc_path.as_os_str().is_empty(), "{d:?}");
+            assert!(
+                !d.name.is_empty() && !d.icc_path.as_os_str().is_empty(),
+                "{d:?}"
+            );
         }
     }
 }

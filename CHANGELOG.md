@@ -7,6 +7,17 @@ published to crates.io, so consumers pin it by git ref rather than by version.
 
 ## [Unreleased]
 
+### Added
+
+- **`readback::{map_read, block_on, ReadbackError}`: the one blocking buffer-readback wait.**
+  `map_read(device, slice)` requests a read map, polls with `wait_indefinitely`, and waits for the
+  callback on a mutex and condition variable (never a channel or `thread::park`, which reach
+  `std::thread::current()` and on glibc pin a plug-in image to the host thread). A callback wgpu drops
+  uncalled is `ReadbackError::Dropped`, not a hang. `GpuImage::read_rgba_f32` uses it (its error
+  variants are unchanged); ofx-rs `ofx::gpu_wgpu` and `ofx-fractal` replace their own copies with it.
+  Tests: `readback::tests::dropped_callback_reports_dropped`, and the ignored GPU
+  `map_read_returns_written_bytes`.
+
 ### Changed
 
 - **`shared_device()` honours wgpu's instance-level environment variables.** Its instance now comes

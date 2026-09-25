@@ -32,7 +32,7 @@
 
 use half::f16;
 
-use crate::shared_device;
+use crate::{ReadbackError, shared_device};
 
 /// The canonical texture format for every [`GpuImage`] in v1: HDR-capable half-float RGBA.
 pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -80,7 +80,7 @@ pub enum GpuImageError {
         /// Actual slice length received.
         got: usize,
     },
-    /// A buffer `map_async` operation failed (channel closed or wgpu map error).
+    /// A buffer map failed ([`crate::map_read`]: a wgpu map error or a callback dropped uncalled).
     #[error("buffer map failed: {0}")]
     Map(String),
     /// [`wgpu::Device::poll`] failed while waiting for the readback map to complete.
@@ -214,16 +214,10 @@ impl GpuImage {
         gpu.queue.submit(std::iter::once(encoder.finish()));
 
         let slice = buffer.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        gpu.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| GpuImageError::Poll(e.to_string()))?;
-        rx.recv()
-            .map_err(|_| GpuImageError::Map("map callback channel closed".into()))?
-            .map_err(|e| GpuImageError::Map(e.to_string()))?;
+        crate::map_read(&gpu.device, &slice).map_err(|e| match e {
+            ReadbackError::Poll(e) => GpuImageError::Poll(e.to_string()),
+            e => GpuImageError::Map(e.to_string()),
+        })?;
         let data = slice
             .get_mapped_range()
             .map_err(|e| GpuImageError::Map(e.to_string()))?; // wgpu 30: fallible
