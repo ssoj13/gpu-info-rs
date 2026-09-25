@@ -51,6 +51,9 @@ mod vram;
 #[cfg(windows)]
 mod win_mem;
 
+/// The displays' ICC profiles from the OS (OCIO's `SystemMonitors` source), wgpu-free.
+pub mod displays;
+
 /// OS-level VRAM + system RAM query without a GPU context, no wgpu: `nvidia-smi` / `reg query` /
 /// sysfs / `system_profiler`. `os` itself stays `#![forbid(unsafe_code)]`; the ONE exception is
 /// Windows RAM, which uses the `GlobalMemoryStatusEx` SYSCALL (isolated in [`win_mem`]) instead of a

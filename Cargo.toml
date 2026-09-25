@@ -77,6 +77,9 @@ windows = { version = "0.62", features = [
     # `LoadLibrary`/`GetProcAddress` for the optional NVML enrichment (`stats::nvml`), which
     # is resolved at run time so a machine with no NVIDIA driver still starts.
     "Win32_System_LibraryLoader",
+    # `displays`: EnumDisplayDevicesW / CreateDCW / DeleteDC, and GetICMProfileW.
+    "Win32_Graphics_Gdi",
+    "Win32_UI_ColorSystem",
 ] }
 
 # Vulkan, everywhere Vulkan can exist. TWO consumers now:
