@@ -42,6 +42,18 @@ const VIDEO_EXT: [&CStr; 4] = [
     c"VK_KHR_video_decode_h264",
 ];
 
+/// Extensions for OTHER APIs sharing this device's memory, added where the adapter has them.
+///
+/// `VK_KHR_external_semaphore_win32`: an image shared with OpenGL (ofx-rs `ofx-host-wgpu`
+/// `GlInterop`, the OpenFX OpenGL render site) is handed between Vulkan and GL with exported
+/// semaphores (`glWaitSemaphoreEXT` / `glSignalSemaphoreEXT` carry the image layout); no
+/// `wgpu::Features` bit asks for it (wgpu-hal 30), so without this every application on the shared
+/// device is refused that site. Windows only: the handle type is `OPAQUE_WIN32`.
+#[cfg(windows)]
+const INTEROP_EXT: [&CStr; 1] = [c"VK_KHR_external_semaphore_win32"];
+#[cfg(not(windows))]
+const INTEROP_EXT: [&CStr; 0] = [];
+
 /// The two extensions without which there is no decoding at all. If either is missing there is no
 /// point adding the rest.
 const VIDEO_CORE: [&CStr; 2] = [c"VK_KHR_video_queue", c"VK_KHR_video_decode_queue"];
@@ -158,6 +170,16 @@ impl core::fmt::Debug for VulkanShared {
 fn present_video_ext(adapter: &wgpu::hal::vulkan::Adapter) -> Vec<&'static CStr> {
     let caps = adapter.physical_device_capabilities();
     VIDEO_EXT
+        .iter()
+        .copied()
+        .filter(|e| caps.supports_extension(e))
+        .collect()
+}
+
+/// The [`INTEROP_EXT`] this adapter really has (asking for a missing one fails `vkCreateDevice`).
+fn present_interop_ext(adapter: &wgpu::hal::vulkan::Adapter) -> Vec<&'static CStr> {
+    let caps = adapter.physical_device_capabilities();
+    INTEROP_EXT
         .iter()
         .copied()
         .filter(|e| caps.supports_extension(e))
@@ -335,6 +357,7 @@ pub(crate) fn open_shared(
             );
         }
         let mut extra = video_ext.clone();
+        extra.extend(present_interop_ext(&hal));
         if sync2_ext {
             extra.push(c"VK_KHR_synchronization2");
         }
@@ -678,6 +701,20 @@ mod tests {
                 !vk.device_extensions.is_empty(),
                 "the enabled extension list is what a consumer must be told; it cannot be empty"
             );
+            // Every interop extension the adapter has is enabled (an implication, as above: on an
+            // adapter without one, it must not be claimed either).
+            // SAFETY: read-only use of the adapter wgpu already owns.
+            let can_interop = unsafe {
+                let hal = shared.adapter.as_hal::<Vulkan>().expect("vulkan adapter");
+                present_interop_ext(&hal)
+            };
+            for ext in INTEROP_EXT {
+                assert_eq!(
+                    vk.device_extensions.iter().any(|e| e.as_c_str() == ext),
+                    can_interop.contains(&ext),
+                    "{ext:?} is enabled exactly when the adapter has it"
+                );
+            }
         } else {
             assert!(
                 shared.vulkan.is_none(),

@@ -1,5 +1,12 @@
 # Integrating `gpu-info-rs` — guide for LLM coding agents
 
+## The shared device enables `VK_KHR_external_semaphore_win32` where the adapter has it (2026-09-28)
+
+`shared_vk::INTEROP_EXT` (Windows): added to the shared device like the video extensions (filtered by
+`supports_extension`, recorded in `VulkanShared::device_extensions`). ofx-rs `ofx-host-wgpu` needs it to hand images
+to OpenGL (the OpenFX OpenGL render site); no `wgpu::Features` bit asks for it. The hardware test asserts it is enabled
+exactly when the adapter has it (mutant: not requested -> red).
+
 ## Read results back with `map_read` (2026-09-25)
 
 `gpu_info::map_read(&device, &buffer.slice(..))` is the one readback wait: map for read, poll
