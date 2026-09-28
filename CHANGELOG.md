@@ -9,6 +9,11 @@ published to crates.io, so consumers pin it by git ref rather than by version.
 
 ### Added
 
+- **The shared device enables `VK_KHR_external_semaphore_win32` where the adapter has it** (Windows,
+  `shared_vk::INTEROP_EXT`, recorded in `VulkanShared::device_extensions`): images shared with OpenGL (ofx-rs
+  `ofx-host-wgpu`, the OpenFX OpenGL render site) are handed over with exported semaphores, which no `wgpu::Features`
+  bit asks for; without it every application on the shared device was refused that site. The hardware test asserts
+  it is enabled exactly when available. `cbe65c7` (2026-09-28).
 - **`readback::{map_read, block_on, ReadbackError}`: the one blocking buffer-readback wait.**
   `map_read(device, slice)` requests a read map, polls with `wait_indefinitely`, and waits for the
   callback on a mutex and condition variable (never a channel or `thread::park`, which reach
