@@ -87,7 +87,10 @@ pub use vram::{
     GpuVramContext, VramInfo, VramQuerier, vram_budget_bytes, vram_budget_from_context,
 };
 #[cfg(feature = "wgpu")]
-pub use wait::{POLL_PERIOD, Submission, WaitError, block_on, map_read, submit, wait, wait_idle};
+pub use wait::{
+    POLL_PERIOD, SLOW_SUBMISSION, Submission, SubmitStats, WaitError, block_on, map_read, submit,
+    submit_stats, wait, wait_idle,
+};
 
 /// Re-exported so consumers spell `wgpu` types from a single, version-matched source.
 #[cfg(feature = "wgpu")]

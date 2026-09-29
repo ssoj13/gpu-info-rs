@@ -31,12 +31,18 @@
 //! module that `dlclose` does not unregister (ofx-rs PLAN 2.5). [`block_on`] uses `pollster`,
 //! which waits the same way.
 //!
+//! **Every submission is labelled and counted** ([`submit_stats`]): per label, how many, how many
+//! are in flight, and the time from `submit` to the observed completion (queueing behind other work
+//! included, so a label whose time is long while its own work is short names what it waits behind).
+//! A submission slower than [`SLOW_SUBMISSION`] is logged at debug level. What finds the work that
+//! holds a device's queue - and so an application's frames - without timestamp queries.
+//!
 //! **Order for callers with error scopes:** call [`map_read`], then pop the scopes, then look at
 //! the result: a scope that captured an out-of-memory error still names the real cause of a
 //! failed map.
 
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The longest a waiter sleeps between two non-blocking polls when no other thread's poll wakes it.
 pub const POLL_PERIOD: Duration = Duration::from_millis(1);
@@ -55,6 +61,53 @@ pub enum WaitError {
     Dropped,
 }
 
+/// A submission slower than this, from `submit` to its observed completion, is logged at debug level.
+pub const SLOW_SUBMISSION: Duration = Duration::from_millis(50);
+
+/// The submissions of one label ([`submit_stats`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubmitStats {
+    /// The label [`submit`] was given.
+    pub label: &'static str,
+    /// Submissions made.
+    pub count: u64,
+    /// Submitted and not yet observed complete.
+    pub in_flight: u64,
+    /// Summed time from `submit` to observed completion, of the completed ones.
+    pub total: Duration,
+    /// The longest of them.
+    pub max: Duration,
+}
+
+/// Every label's [`SubmitStats`], in first-submission order.
+static STATS: Mutex<Vec<SubmitStats>> = Mutex::new(Vec::new());
+
+/// A snapshot of every label's [`SubmitStats`] since the process started.
+pub fn submit_stats() -> Vec<SubmitStats> {
+    STATS.lock().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
+/// Run `update` on `label`'s stats, creating them at the first submission.
+fn with_stats(label: &'static str, update: impl FnOnce(&mut SubmitStats)) {
+    let mut stats = STATS.lock().unwrap_or_else(PoisonError::into_inner);
+    let index = match stats.iter().position(|entry| entry.label == label) {
+        Some(index) => index,
+        None => {
+            stats.push(SubmitStats {
+                label,
+                count: 0,
+                in_flight: 0,
+                total: Duration::ZERO,
+                max: Duration::ZERO,
+            });
+            stats.len() - 1
+        }
+    };
+    if let Some(entry) = stats.get_mut(index) {
+        update(entry);
+    }
+}
+
 /// Work submitted through [`submit`]; [`wait`] blocks until it completed.
 #[must_use = "wait for it, or drop it deliberately: nothing else tells when it completed"]
 pub struct Submission {
@@ -62,23 +115,33 @@ pub struct Submission {
     signal: Arc<Signal>,
 }
 
-/// Submit `commands` on `queue` and register the submission's completion callback (see the module
-/// docs). The only submit of work anyone waits for.
-pub fn submit<I>(queue: &wgpu::Queue, commands: I) -> Submission
+/// Submit `commands` on `queue` as `label` (what the work is, for [`submit_stats`]) and register the
+/// submission's completion callback (see the module docs). The only submit of the cluster.
+pub fn submit<I>(queue: &wgpu::Queue, label: &'static str, commands: I) -> Submission
 where
     I: IntoIterator<Item = wgpu::CommandBuffer>,
 {
     /// Keeps another [`submit`] from landing between a submission and its callback.
     static BIND: Mutex<()> = Mutex::new(());
     let signal: Arc<Signal> = Arc::default();
-    let notify = Notify(Arc::clone(&signal));
+    with_stats(label, |entry| {
+        entry.count += 1;
+        entry.in_flight += 1;
+    });
+    let notify = Notify {
+        signal: Arc::clone(&signal),
+        timed: Some((label, Instant::now())),
+    };
     let _bind = BIND.lock().unwrap_or_else(PoisonError::into_inner);
     #[allow(
         clippy::disallowed_methods,
         reason = "the one submit of the cluster: its completion callback is registered below"
     )]
     queue.submit(commands);
-    queue.on_submitted_work_done(move || notify.finish(Ok(())));
+    queue.on_submitted_work_done(move || {
+        let mut notify = notify;
+        notify.finish(Ok(()));
+    });
     Submission { signal }
 }
 
@@ -91,7 +154,7 @@ pub fn wait(device: &wgpu::Device, submission: &Submission) -> Result<(), WaitEr
 /// that needs the device quiet (tests, teardown, an error handler that must have run) rather than
 /// one submission of its own.
 pub fn wait_idle(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<(), WaitError> {
-    wait(device, &submit(queue, []))
+    wait(device, &submit(queue, "gpu-info wait_idle", []))
 }
 
 /// Map `slice` for reading and block the calling thread until the map finished: the buffer's last
@@ -99,9 +162,13 @@ pub fn wait_idle(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<(), WaitE
 /// `slice.get_mapped_range()` and unmaps the buffer; on `Err` nothing is mapped.
 pub fn map_read(device: &wgpu::Device, slice: &wgpu::BufferSlice<'_>) -> Result<(), WaitError> {
     let signal: Arc<Signal> = Arc::default();
-    let notify = Notify(Arc::clone(&signal));
+    let notify = Notify {
+        signal: Arc::clone(&signal),
+        timed: None,
+    };
     slice.map_async(wgpu::MapMode::Read, move |result| {
-        notify.finish(result.map_err(WaitError::Map))
+        let mut notify = notify;
+        notify.finish(result.map_err(WaitError::Map));
     });
     block(device, &signal)
 }
@@ -118,12 +185,30 @@ type Signal = (Mutex<Option<Result<(), WaitError>>>, Condvar);
 
 /// Owned by a completion callback: records its outcome, or [`WaitError::Dropped`] when wgpu drops
 /// the callback uncalled.
-struct Notify(Arc<Signal>);
+struct Notify {
+    signal: Arc<Signal>,
+    /// A submission's label and submit time, counted in [`submit_stats`] at its first outcome; `None`
+    /// for a map callback.
+    timed: Option<(&'static str, Instant)>,
+}
 
 impl Notify {
-    /// Record the first outcome and wake the waiter.
-    fn finish(&self, result: Result<(), WaitError>) {
-        let (outcome, changed) = &*self.0;
+    /// Record the first outcome (and a submission's time) and wake the waiter.
+    fn finish(&mut self, result: Result<(), WaitError>) {
+        if let Some((label, submitted)) = self.timed.take() {
+            let took = submitted.elapsed();
+            with_stats(label, |entry| {
+                entry.in_flight = entry.in_flight.saturating_sub(1);
+                entry.total += took;
+                entry.max = entry.max.max(took);
+            });
+            if took > SLOW_SUBMISSION {
+                log::debug!(
+                    "gpu-info: submission '{label}' took {took:?} from submit to completion"
+                );
+            }
+        }
+        let (outcome, changed) = &*self.signal;
         let mut outcome = outcome.lock().unwrap_or_else(PoisonError::into_inner);
         if outcome.is_none() {
             *outcome = Some(result);
@@ -174,7 +259,10 @@ mod tests {
     #[test]
     fn dropped_callback_reports_dropped() {
         let signal: Arc<Signal> = Arc::default();
-        drop(Notify(Arc::clone(&signal)));
+        drop(Notify {
+            signal: Arc::clone(&signal),
+            timed: None,
+        });
         let outcome = signal.0.lock().expect("signal").take();
         assert!(matches!(outcome, Some(Err(WaitError::Dropped))));
     }
@@ -201,7 +289,7 @@ mod tests {
         gpu.queue.write_buffer(&source, 0, &bytes);
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         encoder.copy_buffer_to_buffer(&source, 0, &target, 0, size);
-        let _copy = submit(&gpu.queue, [encoder.finish()]);
+        let _copy = submit(&gpu.queue, "gpu-info test", [encoder.finish()]);
         map_read(&gpu.device, &target.slice(..)).expect("map");
         let mapped = target.slice(..).get_mapped_range().expect("range");
         assert_eq!(&mapped[..], &bytes[..]);
@@ -314,7 +402,7 @@ mod tests {
                 pass.set_bind_group(0, &self.group, &[]);
                 pass.dispatch_workgroups(self.invocations / 64, 1, 1);
             }
-            submit(queue, [encoder.finish()])
+            submit(queue, "gpu-info test busy", [encoder.finish()])
         }
     }
 
@@ -329,7 +417,7 @@ mod tests {
         });
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         encoder.copy_buffer_to_buffer(data, 0, &target, 0, size);
-        let _copy = submit(&gpu.queue, [encoder.finish()]);
+        let _copy = submit(&gpu.queue, "gpu-info test", [encoder.finish()]);
         map_read(&gpu.device, &target.slice(..)).expect("map");
         let mapped = target.slice(..).get_mapped_range().expect("range");
         let out = mapped
@@ -360,6 +448,29 @@ mod tests {
             );
             rounds = rounds.saturating_mul(4);
         }
+    }
+
+    /// Every submission is counted under its label: the count, nothing left in flight after the
+    /// wait, and a time at least as long as the work (>= 50 ms here). RED when `submit` records nothing
+    /// or `finish` does not record the time.
+    #[test]
+    #[ignore = "requires GPU"]
+    fn submissions_are_counted_under_their_label() {
+        let gpu = crate::shared_device().expect("shared device");
+        let (rounds, work) = calibrate(gpu, Duration::from_millis(50));
+        let busy = Busy::new(&gpu.device);
+        for _ in 0..2 {
+            wait(&gpu.device, &busy.run(&gpu.device, &gpu.queue, rounds)).expect("wait");
+        }
+        let stats = submit_stats();
+        let entry = stats
+            .iter()
+            .find(|entry| entry.label == "gpu-info test busy")
+            .expect("the label is counted");
+        assert!(entry.count >= 2, "{entry:?}");
+        assert_eq!(entry.in_flight, 0, "{entry:?}");
+        assert!(entry.max * 2 >= work, "{entry:?} for {work:?} of work");
+        assert!(entry.total >= entry.max, "{entry:?}");
     }
 
     /// `wait` returns only after the work completed: measured from `submit`'s return, it lasts at

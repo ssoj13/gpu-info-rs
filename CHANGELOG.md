@@ -9,6 +9,10 @@ published to crates.io, so consumers pin it by git ref rather than by version.
 
 ### Added
 
+- **Labelled submissions and their stats**: `submit(queue, label, commands)`; `submit_stats()` gives, per label, the
+  count, how many are in flight, and the summed / longest time from `submit` to observed completion (queueing
+  included); a submission slower than `SLOW_SUBMISSION` (50 ms) is logged at debug level. What names the work that
+  holds a device's queue, without timestamp queries. Hardware test (red when the time is not recorded).
 - **`compute_device()`: a process-wide device of its own for GPU work read back to host memory** (the OpenFX
   effects' CPU-site compute). A device has one queue: a long dispatch on the device the UI presents on holds every
   UI frame behind it (400 ms median), while on another device of the same adapter the OS time-slices the two at

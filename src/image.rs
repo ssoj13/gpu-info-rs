@@ -161,7 +161,7 @@ impl GpuImage {
         );
         // Flush the staged write so the handle is immediately usable by any consumer, even one
         // that never submits its own work before sampling.
-        let _flushed = crate::submit(&gpu.queue, []);
+        let _flushed = crate::submit(&gpu.queue, "gpu-info GpuImage upload", []);
 
         Ok(Self { tex, width, height })
     }
@@ -211,7 +211,7 @@ impl GpuImage {
                 depth_or_array_layers: 1,
             },
         );
-        let _copy = crate::submit(&gpu.queue, [encoder.finish()]);
+        let _copy = crate::submit(&gpu.queue, "gpu-info GpuImage readback", [encoder.finish()]);
 
         let slice = buffer.slice(..);
         crate::map_read(&gpu.device, &slice).map_err(|e| match e {

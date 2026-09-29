@@ -11,7 +11,8 @@ other.
 
 ## Submit and wait only through `gpu_info::{submit, wait, wait_idle, map_read}` (2026-09-28)
 
-`let done = gpu_info::submit(&queue, commands); gpu_info::wait(&device, &done)?` - never `queue.submit` +
+`let done = gpu_info::submit(&queue, "what it is", commands); gpu_info::wait(&device, &done)?` (the label feeds
+`submit_stats()`) - never `queue.submit` +
 `device.poll(Wait)`. A blocking `Device::poll` holds the device's snatch lock across the fence wait, so the UI's
 `present` waited for the GPU; a timed one panics wgpu-core 30 (`device/resource.rs:948`) when another thread's
 `submit`/`poll` retires the awaited submission between its fence read and its queue check. `submit` binds an
