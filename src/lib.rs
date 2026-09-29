@@ -30,6 +30,8 @@
 //! # }
 //! ```
 
+#[cfg(all(feature = "wgpu", windows))]
+pub mod external;
 /// Canonical GPU media-image handle ([`GpuImage`]) shared by every cluster GPU consumer.
 /// Lives here because this crate anchors wgpu and owns [`shared_device`] (cycle-free).
 #[cfg(feature = "wgpu")]
