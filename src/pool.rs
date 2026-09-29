@@ -192,6 +192,69 @@ impl ResourcePool<wgpu::Texture> {
     }
 }
 
+/// A bound on how many jobs use a pool at once: a counting semaphore whose permit a job takes BEFORE it takes any
+/// pooled resource and holds until it has returned them all.
+///
+/// **Why:** a pool keeps a budget of idle resources, but lends as many as are asked for. With more jobs at once than
+/// the budget holds (Playa: up to 18 render workers staging 4K plates into a pool of three), every extra job creates a
+/// resource and every return beyond the budget frees one: the churn the pool exists to stop (Nsight Systems, Playa
+/// playback: 34 upload staging buffers of 127 MB, 18 upload targets, 13 readbacks created in 25 s even so). A gate
+/// sized to the budget makes the pool's resources enough for every job it admits, and bounds the GPU work those jobs
+/// queue. The permit is taken once per job and never while holding pooled resources, so no job waits holding what
+/// another needs.
+pub struct Gate {
+    free: Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+impl std::fmt::Debug for Gate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Gate").finish_non_exhaustive()
+    }
+}
+
+/// A job's admission through a [`Gate`], given back when dropped.
+#[must_use = "the job is admitted while the permit lives"]
+pub struct Permit<'gate>(&'gate Gate);
+
+impl Gate {
+    /// A gate admitting `permits` jobs at once (at least one).
+    pub const fn new(permits: usize) -> Self {
+        Self {
+            free: Mutex::new(if permits == 0 { 1 } else { permits }),
+            freed: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Wait until a job may run, and admit it. Worker threads only: it blocks.
+    pub fn enter(&self) -> Permit<'_> {
+        let mut free = self
+            .free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *free == 0 {
+            free = self
+                .freed
+                .wait(free)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *free -= 1;
+        Permit(self)
+    }
+}
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        let mut free = self
+            .0
+            .free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *free += 1;
+        self.0.freed.notify_one();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +292,34 @@ mod tests {
         assert_eq!(pool.take(1).map(|f| f.id), Some(1));
         assert_eq!(pool.take(1), None);
         assert_eq!(pool.idle_count(), (1, 10));
+    }
+
+    /// A gate of two admits two jobs at once and a third only after one left: a waiting thread is
+    /// released exactly by a permit's drop (ordered by channels, no timing).
+    #[test]
+    fn a_gate_admits_its_permits_and_waits_for_a_return() {
+        use std::sync::mpsc::channel;
+        let gate = Gate::new(2);
+        let first = gate.enter();
+        let second = gate.enter();
+        let (entered, admitted) = channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _third = gate.enter();
+                entered.send(()).expect("send");
+            });
+            assert!(
+                admitted
+                    .recv_timeout(std::time::Duration::from_millis(200))
+                    .is_err(),
+                "a third job waits while two permits are out"
+            );
+            drop(first);
+            admitted
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("admitted once a permit came back");
+        });
+        drop(second);
     }
 
     /// Beyond the budget the least recently returned are evicted; one larger than the budget is not kept.

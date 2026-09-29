@@ -55,7 +55,7 @@ pub mod wait;
 
 /// Reused GPU resources: bounded per-device pools of buffers and textures (`pool`).
 pub mod pool;
-pub use pool::{BufferKey, Pooled, ResourcePool, TextureKey};
+pub use pool::{BufferKey, Gate, Permit, Pooled, ResourcePool, TextureKey};
 /// Windows RAM via `GlobalMemoryStatusEx` (a syscall, not a `wmic` process spawn) — see [`win_mem`].
 #[cfg(windows)]
 mod win_mem;
