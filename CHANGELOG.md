@@ -9,6 +9,11 @@ published to crates.io, so consumers pin it by git ref rather than by version.
 
 ### Changed
 
+- **`map_read(device, &submission, slice)` takes the copy's submission**: no wait ever asks for "the last
+  submission" (`PollType::Wait { submission_index: None }`). wgpu-core 30 advances
+  `last_successful_submission_index` before it tracks the submission, so a sliced wait for it that timed out
+  beside a concurrent `submit` found the queue empty below its index and panicked (`device/resource.rs:948`, seen in
+  Playa's fractal render). An index `submit` returned is always tracked.
 - **Every GPU wait is sliced: `gpu_info::wait(device, &submission)` and `map_read`** (module
   `readback` renamed `wait`). wgpu-core 30 `Device::maintain` holds the device's snatch lock across
   its fence wait, and `Surface::present` / `Buffer::destroy` take it for writing: one thread's

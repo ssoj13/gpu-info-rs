@@ -7,7 +7,8 @@ another thread presents on or releases resources on: wgpu-core 30 holds the devi
 reading across the whole fence wait, and `present`, `Buffer::destroy` and `unmap` need it for
 writing, so they wait for the GPU too. `gpu_info::wait(&device, &submission)` (the index
 `queue.submit` returned) and `gpu_info::map_read` wait in `WAIT_SLICE` (1 ms) slices instead. Wait
-for your own submission, never the device's last one (that is everyone's work); a caller that needs the
+for your own submission, never the device's last one (that is everyone's work, and with a timeout it panics
+wgpu-core 30 beside a concurrent submit: `wait.rs` module docs); a caller that needs the
 device quiet (tests, teardown) uses `gpu_info::wait_idle(&device, &queue)`.
 
 ## The shared device enables `VK_KHR_external_semaphore_win32` where the adapter has it (2026-09-28)
@@ -19,8 +20,8 @@ exactly when the adapter has it (mutant: not requested -> red).
 
 ## Read results back with `map_read` (2026-09-25)
 
-`gpu_info::map_read(&device, &buffer.slice(..))` is the one readback wait: map for read, poll in
-`WAIT_SLICE` slices until the callback ran; `Err(ReadbackError::{Poll, Map, Dropped})` means
+`gpu_info::map_read(&device, &copy, &buffer.slice(..))` is the one readback wait: map for read, wait in
+`WAIT_SLICE` slices for `copy` (the submission that filled the buffer), then for the callback; `Err(ReadbackError::{Poll, Map, Dropped})` means
 nothing is mapped. Do not write your own `map_async` + `mpsc` wait: plug-in code runs on host
 threads, and a blocking channel receive (or `thread::park`) reaches `std::thread::current()`, which
 on glibc pins the plug-in image to that thread. Drive other wgpu futures (error-scope pops) with

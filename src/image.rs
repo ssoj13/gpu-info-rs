@@ -211,10 +211,10 @@ impl GpuImage {
                 depth_or_array_layers: 1,
             },
         );
-        gpu.queue.submit(std::iter::once(encoder.finish()));
+        let copy = gpu.queue.submit(std::iter::once(encoder.finish()));
 
         let slice = buffer.slice(..);
-        crate::map_read(&gpu.device, &slice).map_err(|e| match e {
+        crate::map_read(&gpu.device, &copy, &slice).map_err(|e| match e {
             ReadbackError::Poll(e) => GpuImageError::Poll(e.to_string()),
             e => GpuImageError::Map(e.to_string()),
         })?;

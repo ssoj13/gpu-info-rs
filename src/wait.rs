@@ -9,7 +9,12 @@
 //! background composites (ofx-rs plan0.md 3.H). A wait of at most [`WAIT_SLICE`] releases the lock
 //! between slices, and `parking_lot`'s task-fair `RwLock` lets a waiting writer in before the next
 //! slice takes it again, so a present waits at most one slice. A submission index is waited for,
-//! never "the last submission": that is every thread's work, not the caller's.
+//! never "the last submission" (`PollType::Wait { submission_index: None }`): that is every
+//! thread's work, not the caller's, and it is unsound with a timeout - wgpu-core 30 advances
+//! `last_successful_submission_index` before it tracks the submission (`device/queue.rs:1728-1733`),
+//! so a slice that times out meanwhile finds the queue empty below the index it waited for and
+//! panics (`device/resource.rs:948`; seen in Playa beside a concurrent submit). An index `submit`
+//! returned is always tracked.
 //!
 //! **Why here:** every wgpu consumer (ofx-rs `ofx::gpu_wgpu`, `ofx-fractal`, `ofx-host-wgpu`,
 //! Playa's compositor, [`crate::GpuImage`]) waits on the same shared device, so this crate owns the
@@ -57,7 +62,7 @@ pub fn wait(
     submission: &wgpu::SubmissionIndex,
 ) -> Result<(), wgpu::PollError> {
     loop {
-        match poll_slice(device, Some(submission)) {
+        match poll_slice(device, submission) {
             Err(wgpu::PollError::Timeout) => {}
             done => return done,
         }
@@ -71,27 +76,21 @@ pub fn wait_idle(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<(), wgpu:
     wait(device, &queue.submit([]))
 }
 
-/// Map `slice` for reading and block the calling thread until the map finished.
-///
-/// Requests the map, then waits in [`WAIT_SLICE`]s until its callback ran (on this thread's poll
-/// or another's): a copy into the buffer submitted before this call has completed by then. On `Ok`
-/// the caller reads `slice.get_mapped_range()` and unmaps the buffer; on `Err` nothing is mapped.
-pub fn map_read(device: &wgpu::Device, slice: &wgpu::BufferSlice<'_>) -> Result<(), ReadbackError> {
+/// Map `slice` for reading and block the calling thread until the map finished: [`wait`] for
+/// `submission` (the last submission that used the buffer, normally the copy into it), then for the
+/// map callback, which that wait's poll or another thread's runs. On `Ok` the caller reads
+/// `slice.get_mapped_range()` and unmaps the buffer; on `Err` nothing is mapped.
+pub fn map_read(
+    device: &wgpu::Device,
+    submission: &wgpu::SubmissionIndex,
+    slice: &wgpu::BufferSlice<'_>,
+) -> Result<(), ReadbackError> {
     let state: Arc<MapState> = Arc::new((Mutex::new(None), Condvar::new()));
     let notify = MapNotify(Arc::clone(&state));
     slice.map_async(wgpu::MapMode::Read, move |result| {
         notify.finish(Some(result))
     });
-    // No index: the map completes with the last submission that used the buffer, which only wgpu
-    // knows. Every slice processes what completed, so the loop ends as soon as the callback ran,
-    // however much other work is queued behind it.
-    while !recorded(&state) {
-        match poll_slice(device, None) {
-            Ok(()) => break,
-            Err(wgpu::PollError::Timeout) => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
+    wait(device, submission)?;
     take(&state)
 }
 
@@ -101,14 +100,14 @@ pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
     pollster::block_on(future)
 }
 
-/// One wait of at most [`WAIT_SLICE`] for `submission` (`None`: the device's last submission).
+/// One wait of at most [`WAIT_SLICE`] for `submission`.
 fn poll_slice(
     device: &wgpu::Device,
-    submission: Option<&wgpu::SubmissionIndex>,
+    submission: &wgpu::SubmissionIndex,
 ) -> Result<(), wgpu::PollError> {
     device
         .poll(wgpu::PollType::Wait {
-            submission_index: submission.cloned(),
+            submission_index: Some(submission.clone()),
             timeout: Some(WAIT_SLICE),
         })
         .map(drop)
@@ -140,15 +139,6 @@ impl Drop for MapNotify {
     fn drop(&mut self) {
         self.finish(None);
     }
-}
-
-/// Whether the callback recorded an outcome yet.
-fn recorded(state: &MapState) -> bool {
-    state
-        .0
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .is_some()
 }
 
 /// Block until the callback recorded an outcome (a poll on another thread may still be running
@@ -202,8 +192,8 @@ mod tests {
         gpu.queue.write_buffer(&source, 0, &bytes);
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         encoder.copy_buffer_to_buffer(&source, 0, &target, 0, size);
-        gpu.queue.submit([encoder.finish()]);
-        map_read(&gpu.device, &target.slice(..)).expect("map");
+        let copy = gpu.queue.submit([encoder.finish()]);
+        map_read(&gpu.device, &copy, &target.slice(..)).expect("map");
         let mapped = target.slice(..).get_mapped_range().expect("range");
         assert_eq!(&mapped[..], &bytes[..]);
         drop(mapped);
