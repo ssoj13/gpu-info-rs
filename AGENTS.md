@@ -1,5 +1,15 @@
 # Integrating `gpu-info-rs` — guide for LLM coding agents
 
+## Reuse large GPU resources through `gpu_info::ResourcePool` (2026-09-29)
+
+`ResourcePool<wgpu::Buffer>` / `ResourcePool<wgpu::Texture>` (`src/pool.rs`): one bounded pool per device and kind
+(`const fn new(budget)`, so a `static` for a process-wide device); `take_buffer(device, BufferKey, label)` /
+`take_texture(device, TextureKey, label)` take the most recently returned resource of the key or create one; `put`
+returns one nobody else holds. Never create and drop a frame-sized buffer or texture per frame: on Windows the
+`vkAllocateMemory` / `vkFreeMemory` behind it stall the process's GPU scheduling (Nsight Systems, Playa playback:
+`vkFreeMemory` up to 668 ms, UI present waiting up to 379 ms). A pooled resource keeps old contents: clear what the
+work reads before writing. Own types (a mapped staging slot) implement `Pooled`.
+
 ## GPU work read back to the host runs on `compute_device()` (2026-09-28)
 
 `gpu_info::compute_device()` is a second process-wide device (its own instance, adapter, max limits, stable features,

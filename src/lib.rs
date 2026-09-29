@@ -52,6 +52,10 @@ mod vram;
 /// panics wgpu-core 30); and the future driver ([`block_on`]) plug-ins may run on host threads.
 #[cfg(feature = "wgpu")]
 pub mod wait;
+
+/// Reused GPU resources: bounded per-device pools of buffers and textures (`pool`).
+pub mod pool;
+pub use pool::{BufferKey, Pooled, ResourcePool, TextureKey};
 /// Windows RAM via `GlobalMemoryStatusEx` (a syscall, not a `wmic` process spawn) — see [`win_mem`].
 #[cfg(windows)]
 mod win_mem;

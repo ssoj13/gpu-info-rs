@@ -8,6 +8,9 @@ published to crates.io, so consumers pin it by git ref rather than by version.
 ## [Unreleased]
 
 ### Added
+- `pool`: `ResourcePool<R: Pooled>` (bounded, per device; `const fn new`), `BufferKey` / `TextureKey`,
+  `take_buffer` / `take_texture`: reuse frame-sized GPU resources instead of allocating and freeing them per frame
+  (`vkFreeMemory` stalls measured up to 668 ms).
 
 - **Labelled submissions and their stats**: `submit(queue, label, commands)`; `submit_stats()` gives, per label, the
   count, how many are in flight, and the summed / longest time from `submit` to observed completion (queueing
