@@ -270,6 +270,34 @@ pub struct SharedGpu {
     pub vulkan: Option<shared_vk::VulkanShared>,
 }
 
+/// Held while either process-wide device ([`shared_device`], [`compute_device`]) is created: wgpu
+/// creates devices of one process one at a time (wgpu issue 10234).
+#[cfg(feature = "wgpu")]
+static DEVICE_CREATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Every stable feature, minus experimental ones (which need an unsafe instance opt-in) and minus
+/// `MAPPABLE_PRIMARY_BUFFERS` (wgpu warns it is a "massive performance footgun" on a discrete GPU;
+/// nobody in the cluster maps primary buffers), so ANY adopter's fast path is satisfied without the
+/// negotiation failing. `request_max_device` intersects it with the adapter's features.
+#[cfg(feature = "wgpu")]
+fn stable_features() -> wgpu::Features {
+    (wgpu::Features::all() & !wgpu::Features::all_experimental_mask())
+        .difference(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS)
+}
+
+/// The high-performance, non-fallback adapter of `instance`: the real discrete GPU, not a software
+/// rasterizer.
+#[cfg(feature = "wgpu")]
+fn high_performance_adapter(instance: &wgpu::Instance) -> Option<wgpu::Adapter> {
+    pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+        apply_limit_buckets: false, // wgpu 30
+    }))
+    .ok()
+}
+
 /// Cached result of THE single process-wide device negotiation. `None` = the negotiation ran and
 /// no adapter/device was available — a cached negative, so a GPU-less machine does not re-probe
 /// on every call.
@@ -346,26 +374,12 @@ pub fn shared_device() -> Option<&'static SharedGpu> {
             // speed up negotiation, but changes which adapters `query`-style consumers of the same
             // instance can see; a separate decision (CHANGELOG, Unreleased, Known issues).
             let instance = wgpu::Instance::new(shared_instance_descriptor());
-            // HighPerformance + no fallback: adopt the real discrete GPU, not a software rasterizer.
-            let adapter =
-                pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::HighPerformance,
-                    force_fallback_adapter: false,
-                    compatible_surface: None,
-                    apply_limit_buckets: false, // wgpu 30
-                }))
-                .ok()?;
-            // Every stable feature, minus experimental ones (which need an unsafe instance opt-in),
-            // so ANY adopter's fast path is satisfied on the one shared device without the whole
-            // negotiation failing. `request_max_device` intersects this with `adapter.features()`.
-            //
-            // Strip MAPPABLE_PRIMARY_BUFFERS: wgpu warns loudly when it is enabled on a discrete
-            // GPU ("massive performance footgun"). Nobody in the cluster maps primary buffers;
-            // vfx-view / squarebob already subtract it for the same reason.
-            let stable_features = (wgpu::Features::all()
-                & !wgpu::Features::all_experimental_mask())
-            .difference(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
-            let features = stable_features & adapter.features();
+            let adapter = high_performance_adapter(&instance)?;
+            let _creating = DEVICE_CREATION
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let stable = stable_features();
+            let features = stable & adapter.features();
             let limits = adapter.limits();
 
             // FIRST try the device that serves both halves: wgpu compute AND hardware video
@@ -389,8 +403,7 @@ pub fn shared_device() -> Option<&'static SharedGpu> {
                  memory",
                 adapter.get_info().backend
             );
-            let (device, queue) =
-                pollster::block_on(request_max_device(&adapter, stable_features)).ok()?;
+            let (device, queue) = pollster::block_on(request_max_device(&adapter, stable)).ok()?;
             Some(SharedGpu {
                 device,
                 queue,
@@ -401,6 +414,65 @@ pub fn shared_device() -> Option<&'static SharedGpu> {
             })
         })
         .as_ref()
+}
+
+/// A process-wide device of its own for GPU work whose results come back to host memory (the OpenFX
+/// effects' CPU-site compute: ofx-rs `ofx::gpu_wgpu`, `ofx-fractal`).
+///
+/// **Why not [`shared_device`]:** a device has one queue, and its work runs in submission order. A
+/// long dispatch on the device the UI draws and presents on holds every later UI frame behind it:
+/// measured on an RTX 3080 Ti (Windows 11, 2026-09-28), a tiny dispatch waited 400 ms (median) behind
+/// 425 ms dispatches on the same device, and 12 ms (median, 30 ms max) behind the same dispatches on
+/// another device of the same adapter - the OS time-slices GPU contexts. Work that is read back
+/// anyway gains nothing from sharing the device, so it gets its own.
+///
+/// **Only between workgroups:** the GPU switches contexts at workgroup boundaries, so what the
+/// other device waits for is how long this device's workgroups run, not its dispatches. Same GPU,
+/// dispatches of ~450 ms: 16384 groups of 64 -> 12 ms; 4096 groups -> 110 ms; 1024 groups -> 465 ms.
+/// Work on this device must therefore keep each workgroup short: many groups, little work per
+/// invocation (no long per-invocation sample loops).
+///
+/// Negotiated once, like [`shared_device`] (same instance environment, adapter choice, maximum
+/// limits and stable features; no video extensions), in the module [`shared_device`] pins, and never
+/// dropped. A process that uses only this one (an OpenFX plug-in in another host) creates one device.
+/// Resources of one device cannot be used on the other.
+#[cfg(feature = "wgpu")]
+pub fn compute_device() -> Option<&'static ComputeGpu> {
+    static COMPUTE: std::sync::OnceLock<Option<ComputeGpu>> = std::sync::OnceLock::new();
+    COMPUTE
+        .get_or_init(|| {
+            if let Err(error) = pin::pin_containing_module() {
+                log::error!(
+                    "gpu-info: no compute device: the module that would own it cannot be pinned \
+                     ({error}); unloading it would leave the device's threads running unmapped code"
+                );
+                return None;
+            }
+            let instance = wgpu::Instance::new(shared_instance_descriptor());
+            let adapter = high_performance_adapter(&instance)?;
+            let _creating = DEVICE_CREATION
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (device, queue) =
+                pollster::block_on(request_max_device(&adapter, stable_features())).ok()?;
+            Some(ComputeGpu {
+                device,
+                queue,
+                adapter,
+            })
+        })
+        .as_ref()
+}
+
+/// The device of [`compute_device`]: `Arc`-backed handles, clone to adopt.
+#[cfg(feature = "wgpu")]
+pub struct ComputeGpu {
+    /// The compute device (maximum limits, every stable feature).
+    pub device: wgpu::Device,
+    /// Its queue.
+    pub queue: wgpu::Queue,
+    /// The adapter it was created from (limits, info).
+    pub adapter: wgpu::Adapter,
 }
 
 /// Major wgpu version this crate targets. Pinned to the `wgpu = "30"` dependency in

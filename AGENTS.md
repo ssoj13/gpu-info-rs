@@ -1,5 +1,14 @@
 # Integrating `gpu-info-rs` — guide for LLM coding agents
 
+## GPU work read back to the host runs on `compute_device()` (2026-09-28)
+
+`gpu_info::compute_device()` is a second process-wide device (its own instance, adapter, max limits, stable features,
+no video extensions). Effects that compute on the GPU and read the result back (ofx-rs `ofx::gpu_wgpu`,
+`ofx-fractal`) use it, never `shared_device()`: one device has one FIFO queue, so their long dispatches held the UI's
+frames (400 ms); across two devices the OS time-slices at workgroup boundaries (12 ms). Keep workgroups short on it
+(16384 groups -> 12 ms, 1024 groups of the same total work -> 465 ms). Resources of one device are not usable on the
+other.
+
 ## Submit and wait only through `gpu_info::{submit, wait, wait_idle, map_read}` (2026-09-28)
 
 `let done = gpu_info::submit(&queue, commands); gpu_info::wait(&device, &done)?` - never `queue.submit` +

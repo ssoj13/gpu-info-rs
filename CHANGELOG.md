@@ -7,6 +7,16 @@ published to crates.io, so consumers pin it by git ref rather than by version.
 
 ## [Unreleased]
 
+### Added
+
+- **`compute_device()`: a process-wide device of its own for GPU work read back to host memory** (the OpenFX
+  effects' CPU-site compute). A device has one queue: a long dispatch on the device the UI presents on holds every
+  UI frame behind it (400 ms median), while on another device of the same adapter the OS time-slices the two at
+  workgroup boundaries (12 ms median for 16384 groups of ~450 ms of work; 110 ms for 4096 groups, 465 ms for 1024 -
+  so work on it must keep each workgroup short). Same negotiation as `shared_device` without video extensions;
+  devices are created one at a time (`DEVICE_CREATION`). Hardware test: small work on the shared device waits
+  < 50 ms beside 16384-group dispatches on the compute device (red, 403 ms, when both are one device).
+
 ### Changed
 
 - **`submit` + `wait`: no blocking or timed `Device::poll` anywhere.** `gpu_info::submit(queue, commands) ->

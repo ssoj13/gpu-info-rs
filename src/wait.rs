@@ -229,12 +229,13 @@ mod tests {
         })
     }
 
-    /// Invocations of one busy dispatch.
+    /// Invocations of the tests' busy dispatches: 4096 workgroups of 64.
     const INVOCATIONS: u32 = 64 * 4096;
 
     /// [`BUSY`] ready to dispatch: its pipeline, a data buffer and the rounds uniform, made once per
     /// thread so a run costs one submission, not a shader compile.
     struct Busy {
+        invocations: u32,
         pipeline: wgpu::ComputePipeline,
         data: wgpu::Buffer,
         uniform: wgpu::Buffer,
@@ -242,38 +243,39 @@ mod tests {
     }
 
     impl Busy {
-        fn new(gpu: &crate::SharedGpu) -> Self {
-            let module = gpu
-                .device
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("wait test busy"),
-                    source: wgpu::ShaderSource::Wgsl(BUSY.into()),
-                });
-            let pipeline = gpu
-                .device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("wait test busy"),
-                    layout: None,
-                    module: &module,
-                    entry_point: Some("main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
-            let data = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        fn new(device: &wgpu::Device) -> Self {
+            Self::with(device, INVOCATIONS)
+        }
+
+        /// [`Busy`] of `invocations` (a multiple of 64).
+        fn with(device: &wgpu::Device, invocations: u32) -> Self {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("wait test busy"),
+                source: wgpu::ShaderSource::Wgsl(BUSY.into()),
+            });
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("wait test busy"),
+                layout: None,
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            let data = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("wait test data"),
-                size: u64::from(INVOCATIONS) * 4,
+                size: u64::from(invocations) * 4,
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_DST
                     | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
-            let uniform = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            let uniform = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("wait test rounds"),
                 size: 16,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &pipeline.get_bind_group_layout(0),
                 entries: &[
@@ -288,6 +290,7 @@ mod tests {
                 ],
             });
             Self {
+                invocations,
                 pipeline,
                 data,
                 uniform,
@@ -296,22 +299,22 @@ mod tests {
         }
 
         /// Seed the data with each invocation's index and run `rounds` LCG steps on it.
-        fn run(&self, gpu: &crate::SharedGpu, rounds: u32) -> Submission {
-            let seeds: Vec<u8> = (0..INVOCATIONS).flat_map(u32::to_le_bytes).collect();
-            gpu.queue.write_buffer(&self.data, 0, &seeds);
-            gpu.queue.write_buffer(
+        fn run(&self, device: &wgpu::Device, queue: &wgpu::Queue, rounds: u32) -> Submission {
+            let seeds: Vec<u8> = (0..self.invocations).flat_map(u32::to_le_bytes).collect();
+            queue.write_buffer(&self.data, 0, &seeds);
+            queue.write_buffer(
                 &self.uniform,
                 0,
                 &[rounds, 0, 0, 0].map(u32::to_le_bytes).concat(),
             );
-            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            let mut encoder = device.create_command_encoder(&Default::default());
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.group, &[]);
-                pass.dispatch_workgroups(INVOCATIONS / 64, 1, 1);
+                pass.dispatch_workgroups(self.invocations / 64, 1, 1);
             }
-            submit(&gpu.queue, [encoder.finish()])
+            submit(queue, [encoder.finish()])
         }
     }
 
@@ -341,11 +344,12 @@ mod tests {
     /// Rounds of busy work that take at least `at_least` on this GPU, and how long they took
     /// (submit to completion).
     fn calibrate(gpu: &crate::SharedGpu, at_least: Duration) -> (u32, Duration) {
-        let busy = Busy::new(gpu);
+        let busy = Busy::new(&gpu.device);
         let mut rounds = 1u32 << 4;
         loop {
             let started = Instant::now();
-            wait(&gpu.device, &busy.run(gpu, rounds)).expect("calibration wait");
+            wait(&gpu.device, &busy.run(&gpu.device, &gpu.queue, rounds))
+                .expect("calibration wait");
             let took = started.elapsed();
             if took >= at_least {
                 return (rounds, took);
@@ -366,8 +370,8 @@ mod tests {
     fn wait_returns_after_the_work_completed() {
         let gpu = crate::shared_device().expect("shared device");
         let (rounds, work) = calibrate(gpu, Duration::from_millis(300));
-        let busy = Busy::new(gpu);
-        let submission = busy.run(gpu, rounds);
+        let busy = Busy::new(&gpu.device);
+        let submission = busy.run(&gpu.device, &gpu.queue, rounds);
         let started = Instant::now();
         wait(&gpu.device, &submission).expect("wait");
         let waited = started.elapsed();
@@ -380,6 +384,79 @@ mod tests {
         assert_eq!(got, want, "the waited-for work's results");
     }
 
+    /// Long work on [`crate::compute_device`] does not hold small work on [`crate::shared_device`]
+    /// behind it when its workgroups are short (16384 groups of ~400 ms of work, as the fractal's
+    /// direct render dispatches): the OS time-slices the two devices at workgroup boundaries
+    /// (measured 12 ms median against 400 ms on one device). RED when `compute_device` hands out the
+    /// shared device: the probe waits for the whole dispatch.
+    #[test]
+    #[ignore = "requires GPU"]
+    fn compute_device_work_does_not_hold_the_shared_device() {
+        let shared = crate::shared_device().expect("shared device");
+        let compute = crate::compute_device().expect("compute device");
+        let heavy = Busy::with(&compute.device, 64 * 16384);
+        let mut rounds = 1u32 << 4;
+        let busy = loop {
+            let started = Instant::now();
+            wait(
+                &compute.device,
+                &heavy.run(&compute.device, &compute.queue, rounds),
+            )
+            .expect("wait");
+            let took = started.elapsed();
+            if took >= Duration::from_millis(400) {
+                break took;
+            }
+            assert!(
+                rounds < 1 << 30,
+                "the GPU finished {rounds} rounds in {took:?}"
+            );
+            rounds = rounds.saturating_mul(2);
+        };
+        // A probe of 64 invocations: its own cost is negligible, so its latency is the queueing.
+        let probe = Busy::with(&shared.device, 64);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runner = std::thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || {
+                // Two dispatches in flight, so the compute queue never drains between them.
+                let mut runs = 0u32;
+                let mut in_flight = heavy.run(&compute.device, &compute.queue, rounds);
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let next = heavy.run(&compute.device, &compute.queue, rounds);
+                    wait(&compute.device, &in_flight).expect("heavy wait");
+                    in_flight = next;
+                    runs += 1;
+                }
+                wait(&compute.device, &in_flight).expect("heavy wait");
+                runs
+            }
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let mut latencies = Vec::new();
+        let started = Instant::now();
+        while started.elapsed() < busy * 3 {
+            let probed = Instant::now();
+            wait(&shared.device, &probe.run(&shared.device, &shared.queue, 1)).expect("probe wait");
+            latencies.push(probed.elapsed());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let runs = runner.join().expect("runner");
+        latencies.sort();
+        let median = latencies[latencies.len() / 2];
+        assert!(
+            runs >= 2,
+            "only {runs} heavy dispatches ran beside the probes"
+        );
+        assert!(
+            median < Duration::from_millis(50) && median * 8 < busy,
+            "small work on the shared device waited {median:?} (median of {}) behind {busy:?} \
+             dispatches on the compute device",
+            latencies.len()
+        );
+    }
+
     /// While a thread waits for long GPU work, another thread's resource release (`Buffer::destroy`
     /// takes the device's snatch lock for writing, as `Surface::present` does) is not held until the
     /// GPU finishes. RED with a blocking `PollType::Wait` in `block`: the releases wait for the
@@ -389,8 +466,8 @@ mod tests {
     fn a_waiter_does_not_hold_a_present_behind_the_gpu() {
         let gpu = crate::shared_device().expect("shared device");
         let (rounds, busy) = calibrate(gpu, Duration::from_millis(400));
-        let work = Busy::new(gpu);
-        let submission = work.run(gpu, rounds);
+        let work = Busy::new(&gpu.device);
+        let submission = work.run(&gpu.device, &gpu.queue, rounds);
         let started = Instant::now();
         let waiter = std::thread::spawn({
             let device = gpu.device.clone();
