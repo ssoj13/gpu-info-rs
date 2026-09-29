@@ -1,15 +1,15 @@
 # Integrating `gpu-info-rs` — guide for LLM coding agents
 
-## Wait for the GPU only through `gpu_info::wait` / `map_read` (2026-09-28)
+## Submit and wait only through `gpu_info::{submit, wait, wait_idle, map_read}` (2026-09-28)
 
-Never call `device.poll(PollType::Wait { timeout: None, .. })` (or `wait_indefinitely`) on a device
-another thread presents on or releases resources on: wgpu-core 30 holds the device's snatch lock for
-reading across the whole fence wait, and `present`, `Buffer::destroy` and `unmap` need it for
-writing, so they wait for the GPU too. `gpu_info::wait(&device, &submission)` (the index
-`queue.submit` returned) and `gpu_info::map_read` wait in `WAIT_SLICE` (1 ms) slices instead. Wait
-for your own submission, never the device's last one (that is everyone's work, and with a timeout it panics
-wgpu-core 30 beside a concurrent submit: `wait.rs` module docs); a caller that needs the
-device quiet (tests, teardown) uses `gpu_info::wait_idle(&device, &queue)`.
+`let done = gpu_info::submit(&queue, commands); gpu_info::wait(&device, &done)?` - never `queue.submit` +
+`device.poll(Wait)`. A blocking `Device::poll` holds the device's snatch lock across the fence wait, so the UI's
+`present` waited for the GPU; a timed one panics wgpu-core 30 (`device/resource.rs:948`) when another thread's
+`submit`/`poll` retires the awaited submission between its fence read and its queue check. `submit` binds an
+`on_submitted_work_done` callback to its submission (one process-wide lock); `wait` polls with `PollType::Poll` only
+and sleeps on a condvar for `POLL_PERIOD` (1 ms; woken early by any thread's poll). `wait_idle(&device, &queue)`
+waits for everything so far; `map_read(&device, &slice)` for a readback's map callback. `clippy.toml` here and in
+ofx-rs / Playa disallows `wgpu::Device::poll` and `wgpu::Queue::submit`. Errors: one `WaitError`.
 
 ## The shared device enables `VK_KHR_external_semaphore_win32` where the adapter has it (2026-09-28)
 
@@ -17,15 +17,6 @@ device quiet (tests, teardown) uses `gpu_info::wait_idle(&device, &queue)`.
 `supports_extension`, recorded in `VulkanShared::device_extensions`). ofx-rs `ofx-host-wgpu` needs it to hand images
 to OpenGL (the OpenFX OpenGL render site); no `wgpu::Features` bit asks for it. The hardware test asserts it is enabled
 exactly when the adapter has it (mutant: not requested -> red).
-
-## Read results back with `map_read` (2026-09-25)
-
-`gpu_info::map_read(&device, &copy, &buffer.slice(..))` is the one readback wait: map for read, wait in
-`WAIT_SLICE` slices for `copy` (the submission that filled the buffer), then for the callback; `Err(ReadbackError::{Poll, Map, Dropped})` means
-nothing is mapped. Do not write your own `map_async` + `mpsc` wait: plug-in code runs on host
-threads, and a blocking channel receive (or `thread::park`) reaches `std::thread::current()`, which
-on glibc pins the plug-in image to that thread. Drive other wgpu futures (error-scope pops) with
-`gpu_info::block_on`. With error scopes: `map_read`, pop the scopes, then check the map result.
 
 ## `shared_device()` pins its module (plug-ins, 2026-09-23)
 

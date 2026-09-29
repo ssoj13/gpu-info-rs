@@ -9,6 +9,15 @@ published to crates.io, so consumers pin it by git ref rather than by version.
 
 ### Changed
 
+- **`submit` + `wait`: no blocking or timed `Device::poll` anywhere.** `gpu_info::submit(queue, commands) ->
+  Submission` registers the submission's `on_submitted_work_done` callback; `wait` / `wait_idle` / `map_read` poll
+  with `PollType::Poll` and sleep on a condvar (`POLL_PERIOD` 1 ms). The sliced timed wait of the previous change
+  still panicked wgpu-core 30 (`device/resource.rs:948`: `Queue::submit` runs `maintain(Poll)` inline and can
+  retire the awaited submission between another waiter's fence read and queue check; seen with Playa's own
+  readback index). `ReadbackError` -> `WaitError`; `WAIT_SLICE` -> `POLL_PERIOD`; `map_read(device, slice)`.
+  `clippy.toml` disallows `wgpu::Device::poll` and `wgpu::Queue::submit` outside `wait.rs`. Hardware tests: a
+  waiter holds no release behind the GPU (red with a blocking poll), `wait` ends only after the work (red when it
+  returns early).
 - **`map_read(device, &submission, slice)` takes the copy's submission**: no wait ever asks for "the last
   submission" (`PollType::Wait { submission_index: None }`). wgpu-core 30 advances
   `last_successful_submission_index` before it tracks the submission, so a sliced wait for it that timed out

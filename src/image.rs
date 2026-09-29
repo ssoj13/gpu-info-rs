@@ -32,7 +32,7 @@
 
 use half::f16;
 
-use crate::{ReadbackError, shared_device};
+use crate::{WaitError, shared_device};
 
 /// The canonical texture format for every [`GpuImage`] in v1: HDR-capable half-float RGBA.
 pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -161,7 +161,7 @@ impl GpuImage {
         );
         // Flush the staged write so the handle is immediately usable by any consumer, even one
         // that never submits its own work before sampling.
-        gpu.queue.submit(std::iter::empty::<wgpu::CommandBuffer>());
+        let _flushed = crate::submit(&gpu.queue, []);
 
         Ok(Self { tex, width, height })
     }
@@ -211,11 +211,11 @@ impl GpuImage {
                 depth_or_array_layers: 1,
             },
         );
-        let copy = gpu.queue.submit(std::iter::once(encoder.finish()));
+        let _copy = crate::submit(&gpu.queue, [encoder.finish()]);
 
         let slice = buffer.slice(..);
-        crate::map_read(&gpu.device, &copy, &slice).map_err(|e| match e {
-            ReadbackError::Poll(e) => GpuImageError::Poll(e.to_string()),
+        crate::map_read(&gpu.device, &slice).map_err(|e| match e {
+            WaitError::Poll(e) => GpuImageError::Poll(e.to_string()),
             e => GpuImageError::Map(e.to_string()),
         })?;
         let data = slice

@@ -1,0 +1,6 @@
+# One submit-and-wait (src/wait.rs): `submit` + `wait` / `wait_idle` / `map_read`. A blocking `Device::poll` held the
+# UI's `present` behind the GPU; its timed form panics wgpu-core 30 beside a concurrent submit.
+disallowed-methods = [
+    { path = "wgpu::Device::poll", reason = "wait through gpu_info::wait / wait_idle / map_read (src/wait.rs)" },
+    { path = "wgpu::Queue::submit", reason = "submit through gpu_info::submit, whose completion gpu_info::wait can wait for" },
+]

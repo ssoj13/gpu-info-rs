@@ -837,8 +837,8 @@ mod tests {
             pass.dispatch_workgroups((n / 64) as u32, 1, 1);
         }
         enc.copy_buffer_to_buffer(&buf, 0, &readback, 0, bytes);
-        let copy = queue.submit([enc.finish()]);
-        crate::map_read(device, &copy, &readback.slice(..)).expect("map");
+        let _copy = crate::submit(queue, [enc.finish()]);
+        crate::map_read(device, &readback.slice(..)).expect("map");
         let view = readback.slice(..).get_mapped_range().expect("map");
         let got: &[f32] = bytemuck::cast_slice(&view);
         assert!(

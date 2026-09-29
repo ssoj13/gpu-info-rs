@@ -47,9 +47,9 @@ mod pin;
 pub mod shared_vk;
 #[cfg(feature = "wgpu")]
 mod vram;
-/// The one blocking GPU wait: a submission ([`wait`]) or a buffer readback ([`map_read`]), in slices
-/// that never hold a `present` behind the GPU; and the future driver ([`block_on`]) plug-ins may run
-/// on host threads.
+/// The one submit-and-wait of the cluster: [`submit`] + [`wait`] / [`wait_idle`] and [`map_read`],
+/// with no blocking `Device::poll` (it held the UI's `present` behind the GPU, and its timed form
+/// panics wgpu-core 30); and the future driver ([`block_on`]) plug-ins may run on host threads.
 #[cfg(feature = "wgpu")]
 pub mod wait;
 /// Windows RAM via `GlobalMemoryStatusEx` (a syscall, not a `wmic` process spawn) — see [`win_mem`].
@@ -87,7 +87,7 @@ pub use vram::{
     GpuVramContext, VramInfo, VramQuerier, vram_budget_bytes, vram_budget_from_context,
 };
 #[cfg(feature = "wgpu")]
-pub use wait::{ReadbackError, WAIT_SLICE, block_on, map_read, wait, wait_idle};
+pub use wait::{POLL_PERIOD, Submission, WaitError, block_on, map_read, submit, wait, wait_idle};
 
 /// Re-exported so consumers spell `wgpu` types from a single, version-matched source.
 #[cfg(feature = "wgpu")]

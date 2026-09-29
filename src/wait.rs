@@ -1,27 +1,32 @@
-//! The ONE blocking GPU wait of the cluster: wait for a submission ([`wait`]), or map a buffer slice
-//! for reading and wait for the map ([`map_read`]), in slices of [`WAIT_SLICE`].
+//! The ONE way the cluster submits GPU work it waits for and waits for it: [`submit`] then [`wait`]
+//! (or [`wait_idle`]), and [`map_read`] for a readback. No wait ever blocks inside wgpu.
 //!
-//! **Why slices, never `PollType::wait_indefinitely`:** wgpu-core 30 `Device::maintain` holds the
-//! device's snatch lock for reading while it waits on the fence (`device/resource.rs:797-879`), and
-//! `Surface::present` (`present.rs:340`), `Buffer::destroy` / `unmap` and every other resource
-//! release take it for writing. One thread waiting indefinitely for its readback therefore froze the
-//! UI's `present` for as long as the GPU worked - Playa measured `Queue::present` at 1.8 s behind
-//! background composites (ofx-rs plan0.md 3.H). A wait of at most [`WAIT_SLICE`] releases the lock
-//! between slices, and `parking_lot`'s task-fair `RwLock` lets a waiting writer in before the next
-//! slice takes it again, so a present waits at most one slice. A submission index is waited for,
-//! never "the last submission" (`PollType::Wait { submission_index: None }`): that is every
-//! thread's work, not the caller's, and it is unsound with a timeout - wgpu-core 30 advances
-//! `last_successful_submission_index` before it tracks the submission (`device/queue.rs:1728-1733`),
-//! so a slice that times out meanwhile finds the queue empty below the index it waited for and
-//! panics (`device/resource.rs:948`; seen in Playa beside a concurrent submit). An index `submit`
-//! returned is always tracked.
+//! **Why never a blocking `Device::poll`:** wgpu-core 30 `Device::maintain` holds the device's
+//! snatch lock for reading across its fence wait (`device/resource.rs:797-879`), and
+//! `Surface::present` (`present.rs:340`), `Buffer::destroy` and `unmap` take it for writing: one
+//! thread waiting for its readback froze the UI's `present` for as long as the GPU worked (Playa:
+//! 1.8 s, ofx-rs plan0.md 3.H5).
 //!
-//! **Why here:** every wgpu consumer (ofx-rs `ofx::gpu_wgpu`, `ofx-fractal`, `ofx-host-wgpu`,
-//! Playa's compositor, [`crate::GpuImage`]) waits on the same shared device, so this crate owns the
-//! wait.
+//! **Why not a blocking poll with a timeout either:** `maintain` reads the fence value, then retires
+//! finished submissions; `Queue::submit` runs `maintain(Poll)` inline (`device/queue.rs:1541`), so
+//! another thread can retire the awaited submission in between. The timed-out waiter then finds the
+//! queue empty below the index it waited for and hits `assert!` at `device/resource.rs:948` (seen
+//! twice in Playa). Only `PollType::Poll` has no index to assert on: the assertion sits inside
+//! `if let Some(wait_submission_index)` (`device/resource.rs:945`), which `Poll` never enters. That
+//! is the guarantee, by construction; a stress test (2 waiters of ~1 ms work beside 2 foreign
+//! pollers, 6000 waits) did not reproduce the race with the old timed wait either, so none is kept.
 //!
-//! **Why a mutex and condition variable, not a channel or a park executor:** plug-ins call this
-//! on host threads. A blocking `std::sync::mpsc` receive and `std::thread::park` both reach
+//! **So:** completion is a callback. [`submit`] registers `Queue::on_submitted_work_done` right
+//! after its submission, both under one process-wide lock, so the callback belongs to that
+//! submission (it attaches to the last tracked submission, `device/life.rs:372-388`; only a
+//! submission made outside this module can slip in between, which makes the wait longer, never
+//! shorter). The waiter polls without blocking (callbacks run inside `poll` and inside every
+//! thread's `submit`) and sleeps on a condition variable for [`POLL_PERIOD`] between polls, woken
+//! early when any thread's poll ran its callback. `Condvar::wait_timeout(1 ms)` measured 1.46 ms
+//! median, 2.5 ms max on Windows 11 (2026-09-28).
+//!
+//! **Why a mutex and condition variable, not a channel or a park executor:** plug-ins call this on
+//! host threads. A blocking `std::sync::mpsc` receive and `std::thread::park` both reach
 //! `std::thread::current()`, which on glibc registers a thread-exit destructor inside the calling
 //! module that `dlclose` does not unregister (ofx-rs PLAN 2.5). [`block_on`] uses `pollster`,
 //! which waits the same way.
@@ -33,65 +38,72 @@
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
-/// The longest one wait holds wgpu-core's device lock: the most a concurrent `present` or resource
-/// release waits for a waiter (see the module docs).
-pub const WAIT_SLICE: Duration = Duration::from_millis(1);
+/// The longest a waiter sleeps between two non-blocking polls when no other thread's poll wakes it.
+pub const POLL_PERIOD: Duration = Duration::from_millis(1);
 
-/// Why a readback wait failed. Every variant means the mapped range must not be read.
+/// Why a wait failed. Every variant means the awaited work's results must not be read.
 #[derive(Debug, thiserror::Error)]
-pub enum ReadbackError {
-    /// [`wgpu::Device::poll`] failed while waiting for the map (device lost, wrong index).
+pub enum WaitError {
+    /// [`wgpu::Device::poll`] failed (device lost).
     #[error("device poll failed: {0}")]
     Poll(#[from] wgpu::PollError),
-    /// wgpu completed the map with an error.
+    /// wgpu completed a buffer map with an error.
     #[error("buffer map failed: {0}")]
     Map(#[from] wgpu::BufferAsyncError),
-    /// wgpu dropped the map callback without calling it (the device or buffer is gone).
-    #[error("buffer map callback dropped without running")]
+    /// wgpu dropped the completion callback without calling it (the device or buffer is gone).
+    #[error("completion callback dropped without running")]
     Dropped,
 }
 
-/// Block the calling thread until `submission` of `device` completed, and run the callbacks
-/// (buffer maps, `on_submitted_work_done`) of every submission completed by then.
-///
-/// Waits in [`WAIT_SLICE`]s, so other threads' `present`, submissions and resource releases are
-/// never held for longer than one slice (see the module docs). `Err` only for a device error or
-/// an index the device never issued, never for the time the GPU takes.
-pub fn wait(
-    device: &wgpu::Device,
-    submission: &wgpu::SubmissionIndex,
-) -> Result<(), wgpu::PollError> {
-    loop {
-        match poll_slice(device, submission) {
-            Err(wgpu::PollError::Timeout) => {}
-            done => return done,
-        }
-    }
+/// Work submitted through [`submit`]; [`wait`] blocks until it completed.
+#[must_use = "wait for it, or drop it deliberately: nothing else tells when it completed"]
+pub struct Submission {
+    /// Set by the submission's completion callback.
+    signal: Arc<Signal>,
+}
+
+/// Submit `commands` on `queue` and register the submission's completion callback (see the module
+/// docs). The only submit of work anyone waits for.
+pub fn submit<I>(queue: &wgpu::Queue, commands: I) -> Submission
+where
+    I: IntoIterator<Item = wgpu::CommandBuffer>,
+{
+    /// Keeps another [`submit`] from landing between a submission and its callback.
+    static BIND: Mutex<()> = Mutex::new(());
+    let signal: Arc<Signal> = Arc::default();
+    let notify = Notify(Arc::clone(&signal));
+    let _bind = BIND.lock().unwrap_or_else(PoisonError::into_inner);
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the one submit of the cluster: its completion callback is registered below"
+    )]
+    queue.submit(commands);
+    queue.on_submitted_work_done(move || notify.finish(Ok(())));
+    Submission { signal }
+}
+
+/// Block the calling thread until `submission` completed (see the module docs: no blocking poll).
+pub fn wait(device: &wgpu::Device, submission: &Submission) -> Result<(), WaitError> {
+    block(device, &submission.signal)
 }
 
 /// [`wait`] for everything submitted to `queue` so far (an empty submission marks it): for a caller
 /// that needs the device quiet (tests, teardown, an error handler that must have run) rather than
 /// one submission of its own.
-pub fn wait_idle(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<(), wgpu::PollError> {
-    wait(device, &queue.submit([]))
+pub fn wait_idle(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<(), WaitError> {
+    wait(device, &submit(queue, []))
 }
 
-/// Map `slice` for reading and block the calling thread until the map finished: [`wait`] for
-/// `submission` (the last submission that used the buffer, normally the copy into it), then for the
-/// map callback, which that wait's poll or another thread's runs. On `Ok` the caller reads
+/// Map `slice` for reading and block the calling thread until the map finished: the buffer's last
+/// submitted use (normally the copy into it) has completed by then. On `Ok` the caller reads
 /// `slice.get_mapped_range()` and unmaps the buffer; on `Err` nothing is mapped.
-pub fn map_read(
-    device: &wgpu::Device,
-    submission: &wgpu::SubmissionIndex,
-    slice: &wgpu::BufferSlice<'_>,
-) -> Result<(), ReadbackError> {
-    let state: Arc<MapState> = Arc::new((Mutex::new(None), Condvar::new()));
-    let notify = MapNotify(Arc::clone(&state));
+pub fn map_read(device: &wgpu::Device, slice: &wgpu::BufferSlice<'_>) -> Result<(), WaitError> {
+    let signal: Arc<Signal> = Arc::default();
+    let notify = Notify(Arc::clone(&signal));
     slice.map_async(wgpu::MapMode::Read, move |result| {
-        notify.finish(Some(result))
+        notify.finish(result.map_err(WaitError::Map))
     });
-    wait(device, submission)?;
-    take(&state)
+    block(device, &signal)
 }
 
 /// Drive a wgpu future (an error-scope pop, an adapter request) to completion on the calling
@@ -100,59 +112,55 @@ pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
     pollster::block_on(future)
 }
 
-/// One wait of at most [`WAIT_SLICE`] for `submission`.
-fn poll_slice(
-    device: &wgpu::Device,
-    submission: &wgpu::SubmissionIndex,
-) -> Result<(), wgpu::PollError> {
-    device
-        .poll(wgpu::PollType::Wait {
-            submission_index: Some(submission.clone()),
-            timeout: Some(WAIT_SLICE),
-        })
-        .map(drop)
-}
+/// A completion outcome, `None` until its callback ran or was dropped uncalled, and the condition
+/// variable its waiter sleeps on.
+type Signal = (Mutex<Option<Result<(), WaitError>>>, Condvar);
 
-/// The map outcome: `None` until the callback ran or was dropped uncalled.
-type MapState = (Mutex<Option<Result<(), ReadbackError>>>, Condvar);
-
-/// Owned by the map callback: records its outcome, or [`ReadbackError::Dropped`] when wgpu drops
+/// Owned by a completion callback: records its outcome, or [`WaitError::Dropped`] when wgpu drops
 /// the callback uncalled.
-struct MapNotify(Arc<MapState>);
+struct Notify(Arc<Signal>);
 
-impl MapNotify {
-    /// Record the first outcome (`None` = dropped uncalled) and wake the waiter.
-    fn finish(&self, result: Option<Result<(), wgpu::BufferAsyncError>>) {
+impl Notify {
+    /// Record the first outcome and wake the waiter.
+    fn finish(&self, result: Result<(), WaitError>) {
         let (outcome, changed) = &*self.0;
         let mut outcome = outcome.lock().unwrap_or_else(PoisonError::into_inner);
         if outcome.is_none() {
-            *outcome = Some(match result {
-                Some(result) => result.map_err(ReadbackError::Map),
-                None => Err(ReadbackError::Dropped),
-            });
+            *outcome = Some(result);
         }
         changed.notify_all();
     }
 }
 
-impl Drop for MapNotify {
+impl Drop for Notify {
     fn drop(&mut self) {
-        self.finish(None);
+        self.finish(Err(WaitError::Dropped));
     }
 }
 
-/// Block until the callback recorded an outcome (a poll on another thread may still be running
-/// it), then take it.
-fn take(state: &MapState) -> Result<(), ReadbackError> {
-    let (outcome, changed) = state;
-    let mut outcome = outcome.lock().unwrap_or_else(PoisonError::into_inner);
+/// Poll `device` without blocking until `signal` holds an outcome, sleeping on its condition
+/// variable for at most [`POLL_PERIOD`] between polls, then take the outcome.
+fn block(device: &wgpu::Device, signal: &Signal) -> Result<(), WaitError> {
+    let (outcome, changed) = signal;
     loop {
-        if let Some(result) = outcome.take() {
+        if let Some(result) = outcome
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
             return result;
         }
-        outcome = changed
-            .wait(outcome)
-            .unwrap_or_else(PoisonError::into_inner);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "PollType::Poll never blocks and has no index to assert on (module docs)"
+        )]
+        device.poll(wgpu::PollType::Poll)?;
+        let guard = outcome.lock().unwrap_or_else(PoisonError::into_inner);
+        if guard.is_none() {
+            let _slept = changed
+                .wait_timeout(guard, POLL_PERIOD)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
     }
 }
 
@@ -165,9 +173,10 @@ mod tests {
     /// instead of blocking it forever.
     #[test]
     fn dropped_callback_reports_dropped() {
-        let state: Arc<MapState> = Arc::new((Mutex::new(None), Condvar::new()));
-        drop(MapNotify(Arc::clone(&state)));
-        assert!(matches!(take(&state), Err(ReadbackError::Dropped)));
+        let signal: Arc<Signal> = Arc::default();
+        drop(Notify(Arc::clone(&signal)));
+        let outcome = signal.0.lock().expect("signal").take();
+        assert!(matches!(outcome, Some(Err(WaitError::Dropped))));
     }
 
     /// A real copy through `map_read` returns the bytes the queue wrote.
@@ -192,15 +201,16 @@ mod tests {
         gpu.queue.write_buffer(&source, 0, &bytes);
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         encoder.copy_buffer_to_buffer(&source, 0, &target, 0, size);
-        let copy = gpu.queue.submit([encoder.finish()]);
-        map_read(&gpu.device, &copy, &target.slice(..)).expect("map");
+        let _copy = submit(&gpu.queue, [encoder.finish()]);
+        map_read(&gpu.device, &target.slice(..)).expect("map");
         let mapped = target.slice(..).get_mapped_range().expect("range");
         assert_eq!(&mapped[..], &bytes[..]);
         drop(mapped);
         target.unmap();
     }
 
-    /// Spin `rounds` iterations per invocation over `buffer`: GPU work long enough to be measured.
+    /// Spin `rounds` LCG iterations per invocation over `data`: GPU work long enough to be measured,
+    /// with a result the CPU can check ([`lcg`]).
     const BUSY: &str = "
         @group(0) @binding(0) var<storage, read_write> data: array<u32>;
         struct Rounds { n: u32 }
@@ -212,95 +222,179 @@ mod tests {
             data[id.x] = x;
         }";
 
-    /// Submit busy work and return its index; `rounds` scales its duration.
-    fn submit_busy(gpu: &crate::SharedGpu, rounds: u32) -> wgpu::SubmissionIndex {
-        const INVOCATIONS: u32 = 64 * 4096;
-        let module = gpu
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("wait test busy"),
-                source: wgpu::ShaderSource::Wgsl(BUSY.into()),
-            });
-        let pipeline = gpu
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("wait test busy"),
-                layout: None,
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-        let data = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("wait test data"),
-            size: u64::from(INVOCATIONS) * 4,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        let uniform = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("wait test rounds"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        gpu.queue.write_buffer(
-            &uniform,
-            0,
-            &[rounds, 0, 0, 0].map(u32::to_le_bytes).concat(),
-        );
-        let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: data.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: uniform.as_entire_binding(),
-                },
-            ],
-        });
-        let mut encoder = gpu.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &group, &[]);
-            pass.dispatch_workgroups(INVOCATIONS / 64, 1, 1);
-        }
-        gpu.queue.submit([encoder.finish()])
+    /// The CPU oracle of [`BUSY`]: `rounds` LCG steps from `seed`.
+    fn lcg(seed: u32, rounds: u32) -> u32 {
+        (0..rounds).fold(seed, |x, _| {
+            x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223)
+        })
     }
 
-    /// While a thread waits for long GPU work, another thread's resource release (`Buffer::destroy`
-    /// takes the device's snatch lock for writing, as `Surface::present` does) is held at most
-    /// about one slice, not until the GPU finishes. RED with an unsliced `wait_indefinitely` in
-    /// `poll_slice`: the releases wait for the whole GPU work.
-    #[test]
-    #[ignore = "requires GPU"]
-    fn a_waiter_does_not_hold_a_present_behind_the_gpu() {
-        let gpu = crate::shared_device().expect("shared device");
-        // Calibrate so the busy work runs for at least 400 ms on this GPU.
-        let mut rounds = 1u32 << 12;
-        let busy = loop {
+    /// Invocations of one busy dispatch.
+    const INVOCATIONS: u32 = 64 * 4096;
+
+    /// [`BUSY`] ready to dispatch: its pipeline, a data buffer and the rounds uniform, made once per
+    /// thread so a run costs one submission, not a shader compile.
+    struct Busy {
+        pipeline: wgpu::ComputePipeline,
+        data: wgpu::Buffer,
+        uniform: wgpu::Buffer,
+        group: wgpu::BindGroup,
+    }
+
+    impl Busy {
+        fn new(gpu: &crate::SharedGpu) -> Self {
+            let module = gpu
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("wait test busy"),
+                    source: wgpu::ShaderSource::Wgsl(BUSY.into()),
+                });
+            let pipeline = gpu
+                .device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("wait test busy"),
+                    layout: None,
+                    module: &module,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+            let data = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("wait test data"),
+                size: u64::from(INVOCATIONS) * 4,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let uniform = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("wait test rounds"),
+                size: 16,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: data.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: uniform.as_entire_binding(),
+                    },
+                ],
+            });
+            Self {
+                pipeline,
+                data,
+                uniform,
+                group,
+            }
+        }
+
+        /// Seed the data with each invocation's index and run `rounds` LCG steps on it.
+        fn run(&self, gpu: &crate::SharedGpu, rounds: u32) -> Submission {
+            let seeds: Vec<u8> = (0..INVOCATIONS).flat_map(u32::to_le_bytes).collect();
+            gpu.queue.write_buffer(&self.data, 0, &seeds);
+            gpu.queue.write_buffer(
+                &self.uniform,
+                0,
+                &[rounds, 0, 0, 0].map(u32::to_le_bytes).concat(),
+            );
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.group, &[]);
+                pass.dispatch_workgroups(INVOCATIONS / 64, 1, 1);
+            }
+            submit(&gpu.queue, [encoder.finish()])
+        }
+    }
+
+    /// The first `count` words of `data` (copied out and mapped after `wait` returned).
+    fn words(gpu: &crate::SharedGpu, data: &wgpu::Buffer, count: u32) -> Vec<u32> {
+        let size = u64::from(count) * 4;
+        let target = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wait test words"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(data, 0, &target, 0, size);
+        let _copy = submit(&gpu.queue, [encoder.finish()]);
+        map_read(&gpu.device, &target.slice(..)).expect("map");
+        let mapped = target.slice(..).get_mapped_range().expect("range");
+        let out = mapped
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect();
+        drop(mapped);
+        target.unmap();
+        out
+    }
+
+    /// Rounds of busy work that take at least `at_least` on this GPU, and how long they took
+    /// (submit to completion).
+    fn calibrate(gpu: &crate::SharedGpu, at_least: Duration) -> (u32, Duration) {
+        let busy = Busy::new(gpu);
+        let mut rounds = 1u32 << 4;
+        loop {
             let started = Instant::now();
-            let index = submit_busy(gpu, rounds);
-            wait(&gpu.device, &index).expect("calibration wait");
+            wait(&gpu.device, &busy.run(gpu, rounds)).expect("calibration wait");
             let took = started.elapsed();
-            if took >= Duration::from_millis(400) {
-                break took;
+            if took >= at_least {
+                return (rounds, took);
             }
             assert!(
                 rounds < 1 << 30,
                 "the GPU finished {rounds} rounds in {took:?}"
             );
             rounds = rounds.saturating_mul(4);
-        };
-        let index = submit_busy(gpu, rounds);
+        }
+    }
+
+    /// `wait` returns only after the work completed: measured from `submit`'s return, it lasts at
+    /// least half the calibrated work (>= 300 ms), and the results equal the CPU oracle. RED if
+    /// `wait` returned early (a callback bound to nothing, or fired before the work).
+    #[test]
+    #[ignore = "requires GPU"]
+    fn wait_returns_after_the_work_completed() {
+        let gpu = crate::shared_device().expect("shared device");
+        let (rounds, work) = calibrate(gpu, Duration::from_millis(300));
+        let busy = Busy::new(gpu);
+        let submission = busy.run(gpu, rounds);
+        let started = Instant::now();
+        wait(&gpu.device, &submission).expect("wait");
+        let waited = started.elapsed();
+        assert!(
+            waited * 2 >= work,
+            "wait returned after {waited:?}; the work takes {work:?}"
+        );
+        let got = words(gpu, &busy.data, 64);
+        let want: Vec<u32> = (0..64).map(|seed| lcg(seed, rounds)).collect();
+        assert_eq!(got, want, "the waited-for work's results");
+    }
+
+    /// While a thread waits for long GPU work, another thread's resource release (`Buffer::destroy`
+    /// takes the device's snatch lock for writing, as `Surface::present` does) is not held until the
+    /// GPU finishes. RED with a blocking `PollType::Wait` in `block`: the releases wait for the
+    /// whole GPU work.
+    #[test]
+    #[ignore = "requires GPU"]
+    fn a_waiter_does_not_hold_a_present_behind_the_gpu() {
+        let gpu = crate::shared_device().expect("shared device");
+        let (rounds, busy) = calibrate(gpu, Duration::from_millis(400));
+        let work = Busy::new(gpu);
+        let submission = work.run(gpu, rounds);
         let started = Instant::now();
         let waiter = std::thread::spawn({
             let device = gpu.device.clone();
-            move || wait(&device, &index).map(|()| Instant::now())
+            move || wait(&device, &submission).map(|()| Instant::now())
         });
         let mut slowest = Duration::ZERO;
         let mut releases = 0;
