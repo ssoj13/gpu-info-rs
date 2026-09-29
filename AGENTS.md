@@ -10,6 +10,20 @@ returns one nobody else holds. Never create and drop a frame-sized buffer or tex
 `vkFreeMemory` up to 668 ms, UI present waiting up to 379 ms). A pooled resource keeps old contents: clear what the
 work reads before writing. Own types (a mapped staging slot) implement `Pooled`.
 
+Bound the jobs that take from one pool with `gpu_info::Gate` (a counting semaphore: `enter` -> `Permit`,
+`enter_owned(&Arc<Gate>)` -> `OwnedPermit` kept by a pending readback): at most as many jobs as the budget holds
+resources, so an admitted job finds its resource pooled (unbounded, 18 render workers created and freed staging past
+the budget). `GpuImage::from_pool` / `return_to` / `write_rgba_f32` keep `GpuImage`s in a `ResourcePool<Texture>`.
+
+## Share a buffer between two wgpu devices with `gpu_info::external` (Windows, 2026-09-29)
+
+`SharedBuffer::export(device, size)` -> (buffer, `Export { handle, allocation, memory_type }`); `SharedBuffer::import`
+(unsafe) on another device of the same GPU (`device_uuid` equal) with the exporter's allocation and memory type -
+the Vulkan rule for `OPAQUE_WIN32` - dedicated; `acquire` / `release` move it to and from `VK_QUEUE_FAMILY_EXTERNAL`
+around each side's use; synchronisation is the caller's (each side proves its own work before the other touches it).
+Both devices need `VK_KHR_external_memory_win32` (every stable wgpu feature asks for it). For the OpenFX Vulkan site
+(ofx-rs plan0 3.A14 V): a plug-in on `compute_device` writing the application's frame in place.
+
 ## GPU work read back to the host runs on `compute_device()` (2026-09-28)
 
 `gpu_info::compute_device()` is a second process-wide device (its own instance, adapter, max limits, stable features,

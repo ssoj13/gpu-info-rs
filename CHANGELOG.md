@@ -8,6 +8,12 @@ published to crates.io, so consumers pin it by git ref rather than by version.
 ## [Unreleased]
 
 ### Added
+- `external` (Windows): `SharedBuffer` - one allocation as a `wgpu::Buffer` on two devices of the same GPU through
+  Vulkan `OPAQUE_WIN32` memory (export / unsafe import with the exporter's size and memory type, dedicated;
+  `acquire` / `release` for `VK_QUEUE_FAMILY_EXTERNAL`; `device_uuid`). Hardware test: a pattern written on the
+  compute device reads back on the shared device and the other way, clean under the Khronos validation layer.
+- `pool::Gate` (`enter` / `enter_owned`): bounds the jobs taking from one pool to what its budget holds.
+- `GpuImage::from_pool` / `return_to` / `write_rgba_f32` / `texture_key`: pooled images.
 - `pool`: `ResourcePool<R: Pooled>` (bounded, per device; `const fn new`), `BufferKey` / `TextureKey`,
   `take_buffer` / `take_texture`: reuse frame-sized GPU resources instead of allocating and freeing them per frame
   (`vkFreeMemory` stalls measured up to 668 ms).
