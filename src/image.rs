@@ -124,8 +124,47 @@ impl GpuImage {
     ///
     /// Errors as [`GpuImage::new`], plus [`GpuImageError::PixelCount`] if `rgba.len()` is wrong.
     pub fn upload_rgba_f32(width: u32, height: u32, rgba: &[f32]) -> Result<Self, GpuImageError> {
+        let image = Self::new(width, height)?;
+        image.write_rgba_f32(rgba)?;
+        Ok(image)
+    }
+
+    /// The [`ResourcePool`](crate::ResourcePool) key of every image of `width` x `height`: its texture's size,
+    /// [`FORMAT`] and usage.
+    pub fn texture_key(width: u32, height: u32) -> crate::TextureKey {
+        crate::TextureKey {
+            width,
+            height,
+            format: FORMAT,
+            usage: USAGE,
+        }
+    }
+
+    /// An image of `width` x `height` whose texture comes from `pool` (the shared device's), else a new one: its
+    /// contents are whatever it last held, so its taker writes it whole ([`Self::write_rgba_f32`], or a copy).
+    /// Give it back with [`Self::return_to`] once nothing else holds its texture.
+    pub fn from_pool(
+        pool: &crate::ResourcePool<wgpu::Texture>,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, GpuImageError> {
         let gpu = shared_device().ok_or(GpuImageError::NoDevice)?;
         validate_dims(width, height, &gpu.device)?;
+        let tex = pool.take_texture(&gpu.device, Self::texture_key(width, height), "GpuImage");
+        Ok(Self { tex, width, height })
+    }
+
+    /// Return this image's texture to `pool` for a later [`Self::from_pool`]; the caller guarantees no clone of
+    /// the texture is still in use (a later taker overwrites it).
+    pub fn return_to(self, pool: &crate::ResourcePool<wgpu::Texture>) {
+        pool.put(self.tex);
+    }
+
+    /// Write interleaved RGBA `f32` (`width * height * 4` floats) into this image, packed `f32 -> f16`, and flush
+    /// it to the queue: the one host upload of every image ([`Self::upload_rgba_f32`]).
+    pub fn write_rgba_f32(&self, rgba: &[f32]) -> Result<(), GpuImageError> {
+        let gpu = shared_device().ok_or(GpuImageError::NoDevice)?;
+        let (width, height) = (self.width, self.height);
         let expected = width as usize * height as usize * 4;
         if rgba.len() != expected {
             return Err(GpuImageError::PixelCount {
@@ -133,16 +172,13 @@ impl GpuImage {
                 got: rgba.len(),
             });
         }
-
-        let tex = make_texture(&gpu.device, width, height);
-
         // Host f32 -> f16 pack. `write_texture` has no 256-byte row-alignment requirement (unlike
         // buffer copies), so a tightly-packed `width * BYTES_PER_PIXEL` stride is correct here.
         let halfs: Vec<f16> = rgba.iter().map(|&v| f16::from_f32(v)).collect();
         let bytes: &[u8] = bytemuck::cast_slice(&halfs);
         gpu.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &tex,
+                texture: &self.tex,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -162,8 +198,7 @@ impl GpuImage {
         // Flush the staged write so the handle is immediately usable by any consumer, even one
         // that never submits its own work before sampling.
         let _flushed = crate::submit(&gpu.queue, "gpu-info GpuImage upload", []);
-
-        Ok(Self { tex, width, height })
+        Ok(())
     }
 
     /// Read the texture back to interleaved RGBA `f32` on the host (GPU->CPU boundary). Blocking.
@@ -338,6 +373,34 @@ mod tests {
     }
 
     /// `adopt` records dims and exposes texture/view/accessors correctly.
+    /// A returned image's texture serves the next image of its size (the pool empties again), and a write
+    /// replaces all of what it held: 0.25 written, returned, taken back, 0.75 written, 0.75 read.
+    #[test]
+    #[ignore = "requires GPU"]
+    fn pooled_images_are_reused_and_written_whole() {
+        let (w, h) = (8u32, 4u32);
+        let n = (w * h * 4) as usize;
+        let pool = crate::ResourcePool::new(1 << 30);
+        let first = GpuImage::from_pool(&pool, w, h).expect("first");
+        first.write_rgba_f32(&vec![0.25; n]).expect("write");
+        first.return_to(&pool);
+        assert_eq!(pool.idle_count(), (1, u64::from(w * h * BYTES_PER_PIXEL)));
+        let second = GpuImage::from_pool(&pool, w, h).expect("second");
+        assert_eq!(
+            pool.idle_count(),
+            (0, 0),
+            "the returned texture is taken again"
+        );
+        second.write_rgba_f32(&vec![0.75; n]).expect("write");
+        assert!(
+            second
+                .read_rgba_f32()
+                .expect("read")
+                .iter()
+                .all(|&v| v == 0.75)
+        );
+    }
+
     #[test]
     #[ignore = "requires GPU"]
     fn adopt_reports_dims() {
