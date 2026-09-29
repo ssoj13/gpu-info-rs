@@ -41,16 +41,17 @@ mod model;
 /// unmapped code).
 #[cfg(feature = "wgpu")]
 mod pin;
-/// The one blocking buffer-readback wait ([`map_read`]) and future driver ([`block_on`]) that
-/// plug-ins may run on host threads.
-#[cfg(feature = "wgpu")]
-pub mod readback;
 /// The shared device as raw Vulkan: video extensions, a decode queue, and the `ash` handles a
 /// hardware decoder needs to run on the SAME device wgpu computes on.
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 pub mod shared_vk;
 #[cfg(feature = "wgpu")]
 mod vram;
+/// The one blocking GPU wait: a submission ([`wait`]) or a buffer readback ([`map_read`]), in slices
+/// that never hold a `present` behind the GPU; and the future driver ([`block_on`]) plug-ins may run
+/// on host threads.
+#[cfg(feature = "wgpu")]
+pub mod wait;
 /// Windows RAM via `GlobalMemoryStatusEx` (a syscall, not a `wmic` process spawn) — see [`win_mem`].
 #[cfg(windows)]
 mod win_mem;
@@ -82,11 +83,11 @@ pub use image::{GpuImage, GpuImageError};
 #[cfg(feature = "wgpu")]
 pub use model::{AdapterReport, DownlevelReport, GpuReport, TextureFormatReport};
 #[cfg(feature = "wgpu")]
-pub use readback::{ReadbackError, block_on, map_read};
-#[cfg(feature = "wgpu")]
 pub use vram::{
     GpuVramContext, VramInfo, VramQuerier, vram_budget_bytes, vram_budget_from_context,
 };
+#[cfg(feature = "wgpu")]
+pub use wait::{ReadbackError, WAIT_SLICE, block_on, map_read, wait};
 
 /// Re-exported so consumers spell `wgpu` types from a single, version-matched source.
 #[cfg(feature = "wgpu")]

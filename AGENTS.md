@@ -1,5 +1,14 @@
 # Integrating `gpu-info-rs` — guide for LLM coding agents
 
+## Wait for the GPU only through `gpu_info::wait` / `map_read` (2026-09-28)
+
+Never call `device.poll(PollType::Wait { timeout: None, .. })` (or `wait_indefinitely`) on a device
+another thread presents on or releases resources on: wgpu-core 30 holds the device's snatch lock for
+reading across the whole fence wait, and `present`, `Buffer::destroy` and `unmap` need it for
+writing, so they wait for the GPU too. `gpu_info::wait(&device, &submission)` (the index
+`queue.submit` returned) and `gpu_info::map_read` wait in `WAIT_SLICE` (1 ms) slices instead. Wait
+for your own submission, never the device's last one (that is everyone's work).
+
 ## The shared device enables `VK_KHR_external_semaphore_win32` where the adapter has it (2026-09-28)
 
 `shared_vk::INTEROP_EXT` (Windows): added to the shared device like the video extensions (filtered by
@@ -9,8 +18,8 @@ exactly when the adapter has it (mutant: not requested -> red).
 
 ## Read results back with `map_read` (2026-09-25)
 
-`gpu_info::map_read(&device, &buffer.slice(..))` is the one readback wait: map for read, poll
-`wait_indefinitely`, wait for the callback; `Err(ReadbackError::{Poll, Map, Dropped})` means
+`gpu_info::map_read(&device, &buffer.slice(..))` is the one readback wait: map for read, poll in
+`WAIT_SLICE` slices until the callback ran; `Err(ReadbackError::{Poll, Map, Dropped})` means
 nothing is mapped. Do not write your own `map_async` + `mpsc` wait: plug-in code runs on host
 threads, and a blocking channel receive (or `thread::park`) reaches `std::thread::current()`, which
 on glibc pins the plug-in image to that thread. Drive other wgpu futures (error-scope pops) with
