@@ -87,7 +87,7 @@ pub use vram::{
     GpuVramContext, VramInfo, VramQuerier, vram_budget_bytes, vram_budget_from_context,
 };
 #[cfg(feature = "wgpu")]
-pub use wait::{ReadbackError, WAIT_SLICE, block_on, map_read, wait};
+pub use wait::{ReadbackError, WAIT_SLICE, block_on, map_read, wait, wait_idle};
 
 /// Re-exported so consumers spell `wgpu` types from a single, version-matched source.
 #[cfg(feature = "wgpu")]

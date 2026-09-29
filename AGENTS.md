@@ -7,7 +7,8 @@ another thread presents on or releases resources on: wgpu-core 30 holds the devi
 reading across the whole fence wait, and `present`, `Buffer::destroy` and `unmap` need it for
 writing, so they wait for the GPU too. `gpu_info::wait(&device, &submission)` (the index
 `queue.submit` returned) and `gpu_info::map_read` wait in `WAIT_SLICE` (1 ms) slices instead. Wait
-for your own submission, never the device's last one (that is everyone's work).
+for your own submission, never the device's last one (that is everyone's work); a caller that needs the
+device quiet (tests, teardown) uses `gpu_info::wait_idle(&device, &queue)`.
 
 ## The shared device enables `VK_KHR_external_semaphore_win32` where the adapter has it (2026-09-28)
 

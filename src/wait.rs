@@ -64,6 +64,13 @@ pub fn wait(
     }
 }
 
+/// [`wait`] for everything submitted to `queue` so far (an empty submission marks it): for a caller
+/// that needs the device quiet (tests, teardown, an error handler that must have run) rather than
+/// one submission of its own.
+pub fn wait_idle(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<(), wgpu::PollError> {
+    wait(device, &queue.submit([]))
+}
+
 /// Map `slice` for reading and block the calling thread until the map finished.
 ///
 /// Requests the map, then waits in [`WAIT_SLICE`]s until its callback ran (on this thread's poll

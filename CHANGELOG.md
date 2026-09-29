@@ -14,7 +14,8 @@ published to crates.io, so consumers pin it by git ref rather than by version.
   its fence wait, and `Surface::present` / `Buffer::destroy` take it for writing: one thread's
   `wait_indefinitely` froze a UI's `present` for as long as the GPU worked (Playa: 1.8 s). The waits
   now poll in slices of `WAIT_SLICE` (1 ms), so a present waits one slice at most; a submission index
-  is waited for, never "the last submission". Hardware test
+  is waited for, never "the last submission" (`wait_idle(device, queue)` waits for everything
+  submitted so far, for tests and teardown). Hardware test
   `wait::tests::a_waiter_does_not_hold_a_present_behind_the_gpu` (red with an unsliced wait).
 
 ### Added
