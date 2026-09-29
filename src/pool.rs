@@ -228,6 +228,18 @@ impl Gate {
 
     /// Wait until a job may run, and admit it. Worker threads only: it blocks.
     pub fn enter(&self) -> Permit<'_> {
+        self.wait_free();
+        Permit(self)
+    }
+
+    /// [`Self::enter`] for a job whose permit outlives the borrow (kept in a value that is handed on, such as a
+    /// pending readback): the permit holds the gate.
+    pub fn enter_owned(gate: &std::sync::Arc<Self>) -> OwnedPermit {
+        gate.wait_free();
+        OwnedPermit(std::sync::Arc::clone(gate))
+    }
+
+    fn wait_free(&self) {
         let mut free = self
             .free
             .lock()
@@ -239,19 +251,37 @@ impl Gate {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         *free -= 1;
-        Permit(self)
+    }
+
+    fn leave(&self) {
+        let mut free = self
+            .free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *free += 1;
+        self.freed.notify_one();
     }
 }
 
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
-        let mut free = self
-            .0
-            .free
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *free += 1;
-        self.0.freed.notify_one();
+        self.0.leave();
+    }
+}
+
+/// A [`Gate`] admission that holds its gate ([`Gate::enter_owned`]), given back when dropped.
+#[must_use = "the job is admitted while the permit lives"]
+pub struct OwnedPermit(std::sync::Arc<Gate>);
+
+impl std::fmt::Debug for OwnedPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedPermit").finish_non_exhaustive()
+    }
+}
+
+impl Drop for OwnedPermit {
+    fn drop(&mut self) {
+        self.0.leave();
     }
 }
 
