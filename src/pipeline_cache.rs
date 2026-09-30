@@ -82,6 +82,25 @@ pub fn pipeline_cache(
     cache
 }
 
+/// `device.create_compute_pipeline(desc)` through the device's persistent cache ([`pipeline_cache`], whatever `desc`
+/// sets as `cache`), saving the cache after the compile: the one way the cluster's compute pipelines are created, so
+/// each shader compiles once per adapter and driver rather than once per process.
+pub fn create_compute_pipeline(
+    device: &wgpu::Device,
+    adapter: &wgpu::AdapterInfo,
+    desc: &wgpu::ComputePipelineDescriptor<'_>,
+) -> wgpu::ComputePipeline {
+    let cache = pipeline_cache(device, adapter);
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        cache: cache.as_deref().map(DiskPipelineCache::cache),
+        ..desc.clone()
+    });
+    if let Some(cache) = cache {
+        cache.save();
+    }
+    pipeline
+}
+
 fn open(device: &wgpu::Device, adapter: &wgpu::AdapterInfo) -> Option<DiskPipelineCache> {
     open_in(device, adapter, &cache_dir()?)
 }

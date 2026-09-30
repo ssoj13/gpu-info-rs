@@ -47,7 +47,7 @@ mod pin;
 #[cfg(feature = "wgpu")]
 pub mod pipeline_cache;
 #[cfg(feature = "wgpu")]
-pub use pipeline_cache::{DiskPipelineCache, pipeline_cache};
+pub use pipeline_cache::{DiskPipelineCache, create_compute_pipeline, pipeline_cache};
 /// The shared device as raw Vulkan: video extensions, a decode queue, and the `ash` handles a
 /// hardware decoder needs to run on the SAME device wgpu computes on.
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
