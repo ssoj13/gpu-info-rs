@@ -55,9 +55,12 @@ mod vram;
 #[cfg(feature = "wgpu")]
 pub mod wait;
 
-/// Reused GPU resources: bounded per-device pools of buffers and textures (`pool`).
+/// Reused GPU resources: bounded per-device pools of buffers and textures (`pool`). The pool
+/// and the `Gate` are wgpu-free; the buffer and texture keys and their pools need `wgpu`.
 pub mod pool;
-pub use pool::{BufferKey, Gate, OwnedPermit, Permit, Pooled, ResourcePool, TextureKey};
+#[cfg(feature = "wgpu")]
+pub use pool::{BufferKey, TextureKey};
+pub use pool::{Gate, OwnedPermit, Permit, Pooled, ResourcePool};
 /// Windows RAM via `GlobalMemoryStatusEx` (a syscall, not a `wmic` process spawn) — see [`win_mem`].
 #[cfg(windows)]
 mod win_mem;

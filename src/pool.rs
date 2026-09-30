@@ -37,12 +37,14 @@ pub trait Pooled {
 }
 
 /// A buffer's key: size and usage.
+#[cfg(feature = "wgpu")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BufferKey {
     pub size: u64,
     pub usage: wgpu::BufferUsages,
 }
 
+#[cfg(feature = "wgpu")]
 impl Pooled for wgpu::Buffer {
     type Key = BufferKey;
     fn key(&self) -> BufferKey {
@@ -57,6 +59,7 @@ impl Pooled for wgpu::Buffer {
 }
 
 /// A 2D texture's key (one mip, one sample, one layer): size, format and usage.
+#[cfg(feature = "wgpu")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TextureKey {
     pub width: u32,
@@ -65,6 +68,7 @@ pub struct TextureKey {
     pub usage: wgpu::TextureUsages,
 }
 
+#[cfg(feature = "wgpu")]
 impl Pooled for wgpu::Texture {
     type Key = TextureKey;
     fn key(&self) -> TextureKey {
@@ -151,6 +155,7 @@ impl<R: Pooled> ResourcePool<R> {
     }
 }
 
+#[cfg(feature = "wgpu")]
 impl ResourcePool<wgpu::Buffer> {
     /// A buffer of `key` from the pool, else a new unmapped one on `device` labelled `label`.
     pub fn take_buffer(&self, device: &wgpu::Device, key: BufferKey, label: &str) -> wgpu::Buffer {
@@ -165,6 +170,7 @@ impl ResourcePool<wgpu::Buffer> {
     }
 }
 
+#[cfg(feature = "wgpu")]
 impl ResourcePool<wgpu::Texture> {
     /// A texture of `key` from the pool, else a new 2D one (one mip, one sample) on `device` labelled `label`.
     pub fn take_texture(
