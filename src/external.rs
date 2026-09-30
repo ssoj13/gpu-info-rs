@@ -18,7 +18,7 @@
 //! touches the buffer).
 
 use ash::vk;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::sync::Arc;
 
 /// The handle type of every shared allocation here.
@@ -213,7 +213,8 @@ impl SharedBuffer {
     }
 
     /// The `size`-byte buffer of an [`Export`] made by another device of the same physical GPU, as a buffer of
-    /// `device`. The handle stays the caller's.
+    /// `device`. The handle stays the caller's: borrowed, never closed (an OpenFX plug-in gets it as a bare value from
+    /// `kOfxImagePropData`, and the host keeps it open).
     ///
     /// # Safety
     ///
@@ -222,7 +223,7 @@ impl SharedBuffer {
     /// `device`'s, and `size` is at most the exported buffer's size.
     pub unsafe fn import(
         device: &wgpu::Device,
-        handle: &OwnedHandle,
+        handle: BorrowedHandle<'_>,
         allocation: u64,
         memory_type: u32,
         size: u64,
@@ -430,6 +431,7 @@ fn allocate_and_bind(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::io::AsHandle;
 
     /// **Two devices of one GPU share a buffer.** Exported on the shared device (Playa's), imported on the
     /// compute device (a plug-in's: another `VkInstance`, another queue); the compute device writes a pattern
@@ -453,7 +455,7 @@ mod tests {
         let imported = unsafe {
             SharedBuffer::import(
                 &plugin.device,
-                &export.handle,
+                export.handle.as_handle(),
                 export.allocation,
                 export.memory_type,
                 size,
