@@ -80,6 +80,13 @@ pub mod displays;
 /// Complements the wgpu capability report and the DXGI [`vram`] adapter budget.
 pub mod os;
 
+/// THE RAM / VRAM budget formulas over [`os`] (one [`budget::Policy`] for RAM, the VRAM share and
+/// the resident-path [`budget::plan_vram`]): wgpu-free, so every consumer sizes its caches alike.
+pub mod budget;
+pub use budget::{
+    BudgetError, Policy, VramError, VramPlan, plan_vram, ram_budget, ram_budget_from, vram_budget,
+};
+
 /// Live GPU counters (utilisation, memory in use) cheap enough to poll from a UI frame loop:
 /// IOKit on macOS, DRM sysfs on Linux, wgpu-free and **spawn-free**. Use this for monitors and
 /// [`os`] for one-shot capability probes — `os` shells out and costs ~1 s per call on macOS.
