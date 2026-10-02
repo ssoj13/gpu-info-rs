@@ -22,6 +22,7 @@ One-stop GPU information crate. Two complementary APIs in one place:
 | Adapter limits / features / formats | `gpu_info::query` | one-shot | needs wgpu |
 | "How much VRAM does this box have" | `gpu_info::os` | ~1 s on macOS | shells out; probe once at start-up and cache |
 | GPU graph in a UI, sampled at 1-10 Hz | `gpu_info::stats` | ~33 µs | syscall / sysfs only, never spawns |
+| "How much RAM / VRAM may my cache use" | `gpu_info::budget` | one OS query | `Policy::{Installed, Available, Min}`; typed error, never a made-up default |
 
 Using `os` where you meant `stats` is the classic mistake: a `system_profiler` spawn per
 sample hitches the caller's UI thread. `stats` exists precisely to make that impossible.

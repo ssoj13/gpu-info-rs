@@ -8,6 +8,11 @@ published to crates.io, so consumers pin it by git ref rather than by version.
 ## [Unreleased]
 
 ### Added
+- `budget`: THE RAM / VRAM budget formulas, moved from exv-tile and scancache so the cluster's 7 ad-hoc formulas can
+  delegate. `Policy::{Installed, Available, Min}` (default `Min`), pure `ram_budget_from`, OS `ram_budget` /
+  `ram_budget_or` (explicit override wins), typed `BudgetError` instead of invented defaults; `vram_share`,
+  `vram_budget_from`, `vram_budget`, `live_headroom`, `plan_vram` / `VramPlan` / `VramError` + `POOL_*` (exv-tile
+  numbers pinned by tests). Additive: no existing API changed.
 - `external` (Windows): `SharedBuffer` - one allocation as a `wgpu::Buffer` on two devices of the same GPU through
   Vulkan `OPAQUE_WIN32` memory (export / unsafe import with the exporter's size and memory type, dedicated;
   `acquire` / `release` for `VK_QUEUE_FAMILY_EXTERNAL`; `device_uuid`). Hardware test: a pattern written on the

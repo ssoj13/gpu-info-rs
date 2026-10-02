@@ -1,5 +1,17 @@
 # Integrating `gpu-info-rs` — guide for LLM coding agents
 
+## Size RAM / VRAM budgets through `gpu_info::budget` (2026-10-01)
+
+ONE home for the budget formulas (7 projects had 3 policies). RAM: `ram_budget_from(total, avail, policy, fraction,
+reserve)` (pure), `ram_budget(policy, fraction, reserve)` (OS), `ram_budget_or(Some(bytes), ..)` (an explicit override
+wins, no OS query). `Policy::Installed` = `min(f*total, total-reserve)` (scancache/playa: caches, property of the machine),
+`Available` = `min(f*avail, avail-reserve)`, `Min` (default) = `min(f*total, total-reserve, avail-reserve)` (exv-tile
+`usable_ram` = `Min, 0.5, 0`). OS query failed = `BudgetError::UnknownRam` / `UnknownVram`: never invent 2/8 GiB.
+VRAM: `vram_share(unified)` 0.66 / 0.25, `vram_budget_from(headroom, unified)`, `vram_budget()` (os::query: free else
+dedicated), `live_headroom(&VramQuerier)` (wgpu), `plan_vram(headroom, unified, fixed, one_tile) -> VramPlan{atlas, decode}`
+(exv-tile semantics and numbers, pinned by tests). No floors in the core: a consumer applies its own (scancache `.max(1)`,
+exv `MIN_BYTES`). Atomic live-resizable budget handles are NOT here (consumer / bufpool side).
+
 ## Reuse large GPU resources through `gpu_info::ResourcePool` (2026-09-29)
 
 `ResourcePool<wgpu::Buffer>` / `ResourcePool<wgpu::Texture>` (`src/pool.rs`): one bounded pool per device and kind
