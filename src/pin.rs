@@ -69,6 +69,8 @@ pub(crate) fn pin_containing_module() -> Result<(), PinError> {
 /// new, so no later `dlclose` unmaps it. The returned handle is deliberately never closed.
 #[cfg(unix)]
 pub(crate) fn pin_containing_module() -> Result<(), PinError> {
+    use std::os::unix::ffi::OsStrExt;
+
     let mut info = std::mem::MaybeUninit::<libc::Dl_info>::zeroed();
     // SAFETY: `dladdr` only reads the address and fills `info`, a live, correctly sized buffer.
     let found = unsafe { libc::dladdr(anchor().cast(), info.as_mut_ptr()) };
@@ -84,6 +86,20 @@ pub(crate) fn pin_containing_module() -> Result<(), PinError> {
             "dladdr returned no file name for gpu-info-rs".into(),
         ));
     }
+    // Executables cannot be dlopened on glibc ("cannot dynamically load PIE").
+    // They are already mapped for the entire process lifetime; only a shared
+    // library needs RTLD_NODELETE. Resolve relative names and symlinks before
+    // comparing the object dladdr found with the running executable.
+    // SAFETY: dladdr supplied the non-null NUL-terminated object name above.
+    let object = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) };
+    let object = std::path::Path::new(std::ffi::OsStr::from_bytes(object.to_bytes()));
+    if let (Ok(object), Ok(executable)) = (
+        std::fs::canonicalize(object),
+        std::env::current_exe().and_then(std::fs::canonicalize),
+    ) && object == executable {
+        return Ok(());
+    }
+
     // SAFETY: `dli_fname` is the NUL-terminated path of an object that is loaded (it contains the
     // running code), and RTLD_NOLOAD guarantees nothing new is loaded or initialised.
     let handle = unsafe {

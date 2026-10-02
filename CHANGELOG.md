@@ -7,6 +7,12 @@ published to crates.io, so consumers pin it by git ref rather than by version.
 
 ## [Unreleased]
 
+### Fixed
+- Unix executable startup: module pinning now recognizes the running executable and returns
+  success without `dlopen`. glibc rejects opening PIE executables, which made `shared_device()`
+  and `compute_device()` return `None` before GPU negotiation. Shared libraries still use
+  `RTLD_NOLOAD | RTLD_NODELETE`. The existing idempotent-pinning regression test now passes on Linux.
+
 ### Added
 - `budget`: THE RAM / VRAM budget formulas, moved from exv-tile and scancache so the cluster's 7 ad-hoc formulas can
   delegate. `Policy::{Installed, Available, Min}` (default `Min`), pure `ram_budget_from`, OS `ram_budget` /
