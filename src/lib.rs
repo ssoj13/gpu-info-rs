@@ -462,30 +462,50 @@ pub fn shared_device() -> Option<&'static SharedGpu> {
 /// Resources of one device cannot be used on the other.
 #[cfg(feature = "wgpu")]
 pub fn compute_device() -> Option<&'static ComputeGpu> {
-    static COMPUTE: std::sync::OnceLock<Option<ComputeGpu>> = std::sync::OnceLock::new();
+    compute_device_status().ok()
+}
+
+/// The cached compute-device negotiation, including why Auto must use CPU when it failed.
+/// The device and its failure are negotiated exactly once, as in [`compute_device`].
+#[cfg(feature = "wgpu")]
+pub fn compute_device_status() -> Result<&'static ComputeGpu, &'static str> {
+    static COMPUTE: std::sync::OnceLock<Result<ComputeGpu, String>> = std::sync::OnceLock::new();
     COMPUTE
         .get_or_init(|| {
-            if let Err(error) = pin::pin_containing_module() {
-                log::error!(
-                    "gpu-info: no compute device: the module that would own it cannot be pinned \
-                     ({error}); unloading it would leave the device's threads running unmapped code"
-                );
-                return None;
-            }
+            pin::pin_containing_module().map_err(|error| {
+                let reason = format!("the plug-in module cannot be pinned: {error}");
+                log::error!("gpu-info: no compute device: {reason}");
+                reason
+            })?;
             let instance = wgpu::Instance::new(shared_instance_descriptor());
-            let adapter = high_performance_adapter(&instance)?;
+            let adapter =
+                pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                    apply_limit_buckets: false,
+                }))
+                .map_err(|error| format!("no high-performance compute adapter: {error}"))?;
             let _creating = DEVICE_CREATION
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let (device, queue) =
-                pollster::block_on(request_max_device(&adapter, stable_features())).ok()?;
-            Some(ComputeGpu {
+                pollster::block_on(request_max_device(&adapter, stable_features())).map_err(
+                    |error| {
+                        format!(
+                            "cannot create compute device on {}: {error}",
+                            adapter.get_info().name
+                        )
+                    },
+                )?;
+            Ok(ComputeGpu {
                 device,
                 queue,
                 adapter,
             })
         })
         .as_ref()
+        .map_err(String::as_str)
 }
 
 /// The device of [`compute_device`]: `Arc`-backed handles, clone to adopt.
