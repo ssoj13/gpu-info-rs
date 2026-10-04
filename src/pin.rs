@@ -96,7 +96,8 @@ pub(crate) fn pin_containing_module() -> Result<(), PinError> {
     if let (Ok(object), Ok(executable)) = (
         std::fs::canonicalize(object),
         std::env::current_exe().and_then(std::fs::canonicalize),
-    ) && object == executable {
+    ) && object == executable
+    {
         return Ok(());
     }
 
