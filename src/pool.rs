@@ -238,6 +238,29 @@ impl Gate {
         Permit(self)
     }
 
+    /// Admit a worker job while checking cancellation outside the gate's lock.
+    /// A cancelled waiter consumes no permit and does not stop active jobs.
+    pub fn enter_until(&self, mut keep_waiting: impl FnMut() -> bool) -> Option<Permit<'_>> {
+        loop {
+            if !keep_waiting() {
+                return None;
+            }
+            let mut free = self
+                .free
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *free != 0 {
+                *free -= 1;
+                return Some(Permit(self));
+            }
+            let waited = self
+                .freed
+                .wait_timeout(free, std::time::Duration::from_millis(10))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            drop(waited);
+        }
+    }
+
     /// [`Self::enter`] for a job whose permit outlives the borrow (kept in a value that is handed on, such as a
     /// pending readback): the permit holds the gate.
     pub fn enter_owned(gate: &std::sync::Arc<Self>) -> OwnedPermit {
@@ -328,6 +351,25 @@ mod tests {
         assert_eq!(pool.take(1).map(|f| f.id), Some(1));
         assert_eq!(pool.take(1), None);
         assert_eq!(pool.idle_count(), (1, 10));
+    }
+
+    #[test]
+    fn a_cancelled_gate_waiter_consumes_no_permit() {
+        let gate = Gate::new(1);
+        let owner = gate.enter();
+        let mut polls = 0;
+        assert!(
+            gate.enter_until(|| {
+                polls += 1;
+                polls < 3
+            })
+            .is_none()
+        );
+        assert!(gate.enter_until(|| false).is_none());
+        drop(owner);
+        let admitted = gate.enter_until(|| true).expect("permit returned");
+        drop(admitted);
+        assert!(gate.enter_until(|| true).is_some());
     }
 
     /// A gate of two admits two jobs at once and a third only after one left: a waiting thread is

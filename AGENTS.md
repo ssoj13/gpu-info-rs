@@ -23,7 +23,8 @@ returns one nobody else holds. Never create and drop a frame-sized buffer or tex
 work reads before writing. Own types (a mapped staging slot) implement `Pooled`.
 
 Bound the jobs that take from one pool with `gpu_info::Gate` (a counting semaphore: `enter` -> `Permit`,
-`enter_owned(&Arc<Gate>)` -> `OwnedPermit` kept by a pending readback): at most as many jobs as the budget holds
+`enter_owned(&Arc<Gate>)` -> `OwnedPermit` kept by a pending readback; cancellable workers use
+`enter_until(|| !cancelled())` -> `Option<Permit>`, checking outside the mutex every 10 ms): at most as many jobs as the budget holds
 resources, so an admitted job finds its resource pooled (unbounded, 18 render workers created and freed staging past
 the budget). `GpuImage::from_pool` / `return_to` / `write_rgba_f32` keep `GpuImage`s in a `ResourcePool<Texture>`.
 
