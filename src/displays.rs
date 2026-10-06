@@ -95,8 +95,11 @@ fn platform() -> Vec<DisplayProfile> {
 
     // Core Graphics types
     type CGDirectDisplayID = u32;
+    type CFIndex = isize;
+    type CFErrorRef = *const c_void;
     type CFStringRef = *const c_void;
     type CFURLRef = *const c_void;
+    type ColorSyncProfileRef = *const c_void;
 
     #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {
@@ -109,7 +112,9 @@ fn platform() -> Vec<DisplayProfile> {
 
     #[link(name = "ColorSync", kind = "framework")]
     unsafe extern "C" {
-        fn ColorSyncProfileCopyURLForDisplay(display: CGDirectDisplayID) -> CFURLRef;
+        fn ColorSyncProfileCreateWithDisplayID(display: CGDirectDisplayID) -> ColorSyncProfileRef;
+        fn ColorSyncProfileGetURL(profile: ColorSyncProfileRef, error: *mut CFErrorRef)
+        -> CFURLRef;
     }
 
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -118,7 +123,7 @@ fn platform() -> Vec<DisplayProfile> {
         fn CFStringGetCString(
             string: CFStringRef,
             buffer: *mut i8,
-            buffer_size: i64,
+            buffer_size: CFIndex,
             encoding: u32,
         ) -> bool;
         fn CFRelease(cf: *const c_void);
@@ -141,19 +146,27 @@ fn platform() -> Vec<DisplayProfile> {
         return out;
     }
 
-    for i in 0..display_count as usize {
-        let display_id = display_ids[i];
-
-        // Get ICC profile URL
-        let url = unsafe { ColorSyncProfileCopyURLForDisplay(display_id) };
-        if url.is_null() {
+    for (i, display_id) in display_ids
+        .iter()
+        .take(display_count as usize)
+        .copied()
+        .enumerate()
+    {
+        // ColorSync owns the display-profile lookup; the returned profile follows Create ownership.
+        let profile = unsafe { ColorSyncProfileCreateWithDisplayID(display_id) };
+        if profile.is_null() {
             continue;
         }
 
-        // Convert URL to path
-        let path_str = unsafe { CFURLCopyFileSystemPath(url, kCFURLPOSIXPathStyle) };
+        // ColorSyncProfileGetURL returns a borrowed URL. Copy the path before releasing profile.
+        let url = unsafe { ColorSyncProfileGetURL(profile, std::ptr::null_mut()) };
+        let path_str = if url.is_null() {
+            std::ptr::null()
+        } else {
+            unsafe { CFURLCopyFileSystemPath(url, kCFURLPOSIXPathStyle) }
+        };
         unsafe {
-            CFRelease(url);
+            CFRelease(profile);
         }
 
         if path_str.is_null() {

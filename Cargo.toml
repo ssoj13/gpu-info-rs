@@ -82,14 +82,16 @@ windows = { version = "0.62", features = [
     "Win32_UI_ColorSystem",
 ] }
 
-# Vulkan, everywhere Vulkan can exist. TWO consumers now:
-#   - `vram.rs`  : VK_EXT_memory_budget via `Adapter::as_hal` (Linux).
+# Vulkan, exactly where wgpu 30 enables its native Vulkan HAL by default. TWO consumers now:
+#   - `vram.rs`  : VK_EXT_memory_budget via `Adapter::as_hal` (Linux/Android/FreeBSD).
 #   - `shared_vk`: the ONE device that serves wgpu compute AND hardware video decode, plus the raw
 #                  handles a decoder (ffmpeg-rs `av-hwaccel-vulkan`) runs on.
+# Apple uses Metal by default. Do not force `vulkan-portability`/MoltenVK there: the portable
+# `shared_vk` API reports `None` and the ordinary Metal device path remains native.
 # Pinned to 0.38, the version wgpu-hal 30 itself uses, so the handles we hand out are the SAME
 # types a consumer built against wgpu-hal sees - a mismatch here would not be a type error at the
 # boundary, it would be two incompatible `ash::Device`s in one process.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+[target.'cfg(any(windows, target_os = "linux", target_os = "android", target_os = "freebsd"))'.dependencies]
 ash = { version = "0.38", default-features = false, features = ["std", "loaded"] }
 
 # Unix: `dladdr` + `dlopen(RTLD_NOLOAD | RTLD_NODELETE)` pin the module that owns the shared

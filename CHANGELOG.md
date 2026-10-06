@@ -8,6 +8,13 @@ published to crates.io, so consumers pin it by git ref rather than by version.
 ## [Unreleased]
 
 ### Fixed
+- Native backend selection now matches wgpu 30: Vulkan device sharing and `ash` compile only on
+  Windows, Linux, Android, and FreeBSD; macOS and other native targets retain the portable
+  `SharedGpu::vulkan` API as `None` and use their ordinary backend (Metal on macOS). This fixes
+  macOS builds without requiring MoltenVK or changing the Windows/Linux Vulkan fast path.
+- macOS display profile discovery now uses the public
+  `ColorSyncProfileCreateWithDisplayID`/`ColorSyncProfileGetURL` API and the correct `CFIndex`
+  ABI, replacing a nonexistent `ColorSyncProfileCopyURLForDisplay` symbol that failed at link time.
 - Unix executable startup: module pinning now recognizes the running executable and returns
   success without `dlopen`. glibc rejects opening PIE executables, which made `shared_device()`
   and `compute_device()` return `None` before GPU negotiation. Shared libraries still use

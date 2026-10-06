@@ -129,9 +129,9 @@ mod imp {
 }
 
 // ===========================================================================
-// Linux — Vulkan VK_EXT_memory_budget
+// Linux / Android / FreeBSD — Vulkan VK_EXT_memory_budget
 // ===========================================================================
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
 mod imp {
     use super::{GpuVramContext, VramInfo};
     use ash::vk;
@@ -235,21 +235,27 @@ mod imp {
         pub fn query(&self) -> Option<VramInfo> {
             Some(VramInfo {
                 used: self.device.currentAllocatedSize() as u64,
-                budget: self.device.recommendedMaxWorkingSetSize() as u64,
+                budget: self.device.recommendedMaxWorkingSetSize(),
             })
         }
     }
 
     pub(super) fn vram_budget_from_context(ctx: GpuVramContext<'_>) -> Option<u64> {
         let mtl = mtl_from_wgpu_device(ctx.device)?;
-        Some(mtl.recommendedMaxWorkingSetSize() as u64)
+        Some(mtl.recommendedMaxWorkingSetSize())
     }
 }
 
 // ===========================================================================
 // Fallback — any other platform
 // ===========================================================================
-#[cfg(not(any(windows, all(unix, not(target_os = "macos")), target_os = "macos")))]
+#[cfg(not(any(
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "macos"
+)))]
 mod imp {
     use super::{GpuVramContext, VramInfo};
 
@@ -311,7 +317,7 @@ pub fn vram_budget_bytes(adapter: &wgpu::Adapter) -> Option<u64> {
         return imp::vram_budget_adapter(adapter);
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
     if adapter.get_info().backend == wgpu::Backend::Vulkan {
         return imp::vram_budget_adapter(adapter);
     }
@@ -325,7 +331,13 @@ pub fn vram_budget_bytes(adapter: &wgpu::Adapter) -> Option<u64> {
         return None;
     }
 
-    #[cfg(not(any(windows, all(unix, not(target_os = "macos")), target_os = "macos")))]
+    #[cfg(not(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "macos"
+    )))]
     {
         let _ = adapter;
         return None;

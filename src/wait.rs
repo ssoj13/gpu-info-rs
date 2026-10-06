@@ -420,10 +420,12 @@ mod tests {
         let _copy = submit(&gpu.queue, "gpu-info test", [encoder.finish()]);
         map_read(&gpu.device, &target.slice(..)).expect("map");
         let mapped = target.slice(..).get_mapped_range().expect("range");
-        let out = mapped
-            .chunks_exact(4)
-            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
-            .collect();
+        let (words, remainder) = mapped.as_chunks::<4>();
+        assert!(
+            remainder.is_empty(),
+            "mapped word buffer is not u32-aligned"
+        );
+        let out = words.iter().copied().map(u32::from_le_bytes).collect();
         drop(mapped);
         target.unmap();
         out

@@ -50,7 +50,31 @@ pub mod pipeline_cache;
 pub use pipeline_cache::{DiskPipelineCache, create_compute_pipeline, pipeline_cache};
 /// The shared device as raw Vulkan: video extensions, a decode queue, and the `ash` handles a
 /// hardware decoder needs to run on the SAME device wgpu computes on.
-#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+///
+/// wgpu's native Vulkan backend exists on Windows, Linux, Android, and FreeBSD. Other native
+/// targets expose the same API through a backend-unavailable implementation so
+/// [`SharedGpu::vulkan`] remains portable and reports `None` without pulling in Vulkan.
+#[cfg(all(
+    feature = "wgpu",
+    any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd"
+    )
+))]
+pub mod shared_vk;
+#[cfg(all(
+    feature = "wgpu",
+    not(target_arch = "wasm32"),
+    not(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd"
+    ))
+))]
+#[path = "shared_vk_unavailable.rs"]
 pub mod shared_vk;
 #[cfg(feature = "wgpu")]
 mod vram;
