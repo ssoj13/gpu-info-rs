@@ -7,6 +7,15 @@ published to crates.io, so consumers pin it by git ref rather than by version.
 
 ## [Unreleased]
 
+### Documentation (2026-10-07)
+
+- Clarify the native Vulkan consumer predicate, the opaque `VulkanShared` API on other
+  native targets and ordinary Metal device creation on macOS. Consumers must guard raw
+  handle/HAL access at compile time; runtime `None` checks are insufficient.
+- Record the source boundary: GPU-info fix `35a81c9` (2026-10-06), downstream FFmpeg
+  bridge fix `5f0e71c`, and Playa consumer `a03156b`. This refresh adds no source change,
+  compile/test receipt or macOS link/hardware acceptance.
+
 ### Fixed
 - Native backend selection now matches wgpu 30: Vulkan device sharing and `ash` compile only on
   Windows, Linux, Android, and FreeBSD; macOS and other native targets retain the portable

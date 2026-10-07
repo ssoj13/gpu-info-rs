@@ -77,9 +77,25 @@ module that cannot be pinned gets `None`, with the reason logged as an error. Do
 this by creating your own device in a plug-in; that device would leak the same way. Regression:
 `cargo test --test unload_regression -- --ignored` (Windows, GPU).
 
+## Native Vulkan consumer boundary (2026-10-06)
+
+Native Vulkan sharing and its `ash` dependency compile only for
+`cfg(any(windows, target_os = "linux", target_os = "android", target_os = "freebsd"))`.
+On other native targets, `shared_vk_unavailable.rs` keeps `VulkanShared` as an opaque API
+placeholder and `SharedGpu::vulkan` is always `None`; macOS requests its ordinary native
+Metal device. Do not add Vulkan fields to that placeholder or force MoltenVK for this path.
+
+A consumer that accesses `decode_queue`, `entry`, other raw handles or wgpu's Vulkan HAL
+must use this same compile-time predicate and keep a portable unavailable result elsewhere.
+A runtime `Some` check alone cannot guard types/fields excluded from the target build.
+FFmpeg's source fix `5f0e71c` follows GPU-info `35a81c9`: adoption returns `Ok(false)`,
+the capability probe returns `false`, and Vulkan image wrapping/lending returns `ENOSYS`
+on unsupported targets. Source review is not macOS compile/link/hardware acceptance.
+
 ## ONE device, and it can decode video (2026-09-19)
 
-`shared_device()` no longer just calls `request_device`. On a Vulkan adapter it builds the logical
+On a native Vulkan-capable target, `shared_device()` no longer just calls `request_device`.
+On a Vulkan adapter it builds the logical
 device through `wgpu_hal::vulkan::Adapter::open_with_callback`, ADDING the `VK_KHR_video_*`
 extensions and a decode-queue family to what wgpu itself requires, and wgpu then adopts that device
 (`create_device_from_hal`). `SharedGpu::vulkan` carries the raw `ash` handles (entry, instance,
@@ -89,8 +105,10 @@ pass with **no copy through host memory**. Proven before it was written: an NV12
 through the decode queue, wrapped with `texture_from_raw`, read by a compute pass — 0 wrong of 4096
 pixels (RTX 3080 Ti, driver 616.64, wgpu 30.0.1).
 
-- `vulkan == None` means this adapter cannot do it (not Vulkan, or no decode queue). That case is
-  logged as a WARNING, because it silently doubles the cost of every decoded frame.
+- `vulkan == None` means shared Vulkan video is unavailable: the target/backend is not Vulkan,
+  or the adapter has no decode queue. This is normal for native Metal on macOS. Consumers
+  must report that capability separately from ordinary wgpu rendering; no universal frame-cost
+  claim follows from it.
 - The device is created with `ExperimentalFeatures::enabled()` — required for passthrough shaders
   (CubeCL's SPIR-V / MSL). No experimental FEATURE is requested.
 - Do NOT destroy anything in `SharedGpu::vulkan`: wgpu owns the device.
