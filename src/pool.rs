@@ -85,10 +85,213 @@ impl Pooled for wgpu::Texture {
     }
 }
 
+/// One shared pool for the process-lifetime `compute_device()` only.
+///
+/// Effects share its 512-MiB/256-entry idle ceiling instead of multiplying per-effect
+/// budgets. Never put a shared_device, external or application-device buffer here.
+/// A caller must submit all old accesses before returning a buffer; map views must
+/// be dropped and readbacks unmapped. Active-job admission remains the caller's.
+#[cfg(feature = "wgpu")]
+pub static COMPUTE_BUFFERS: ResourcePool<wgpu::Buffer> = ResourcePool::with_limits(512 << 20, 256);
+
+/// A short-lived compute workspace. Its buffers return to the shared pool only
+/// after the caller explicitly completes the job; dropping an incomplete workspace
+/// simply drops its handles. All dispatches and mappings must be finished first.
+#[cfg(feature = "wgpu")]
+pub struct BufferWorkspace<'gpu> {
+    gpu: &'gpu crate::ComputeGpu,
+    pool: Option<&'static ResourcePool<wgpu::Buffer>>,
+    held: Vec<wgpu::Buffer>,
+}
+
+/// A checked workspace metadata/descriptor failure.
+#[cfg(feature = "wgpu")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BufferWorkspaceError {
+    /// Host metadata allocation failed.
+    Allocation,
+    /// Descriptor cannot be used as an unmapped reusable buffer.
+    InvalidDescriptor,
+}
+#[cfg(feature = "wgpu")]
+impl std::fmt::Display for BufferWorkspaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+#[cfg(feature = "wgpu")]
+impl std::error::Error for BufferWorkspaceError {}
+
+#[cfg(feature = "wgpu")]
+impl<'gpu> BufferWorkspace<'gpu> {
+    /// Pool only on the exact process-lifetime compute device. Foreign devices
+    /// retain ordinary allocation behavior and can never contaminate this pool.
+    pub fn new(gpu: &'gpu crate::ComputeGpu) -> Self {
+        let pool = crate::compute_device()
+            .filter(|device| std::ptr::eq(*device, gpu))
+            .map(|_| &COMPUTE_BUFFERS);
+        Self {
+            gpu,
+            pool,
+            held: Vec::new(),
+        }
+    }
+    fn retain(&mut self, buffer: wgpu::Buffer) -> wgpu::Buffer {
+        self.held.push(buffer.clone());
+        buffer
+    }
+    fn reserve(&mut self) -> Result<(), BufferWorkspaceError> {
+        self.held
+            .try_reserve(1)
+            .map_err(|_| BufferWorkspaceError::Allocation)
+    }
+    /// Check out an exactly sized buffer and encode its initialization now.
+    /// The encoder must belong to this workspace's device and execute the clear
+    /// before the buffer's first
+    /// read or accumulation; there are no deferred clears or extra submissions.
+    /// Use `upload` for complete queue uploads rather than overwriting a buffer
+    /// whose clear is still unsubmitted.
+    pub fn zeroed_buffer(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        descriptor: &wgpu::BufferDescriptor<'_>,
+    ) -> Result<wgpu::Buffer, BufferWorkspaceError> {
+        let buffer = self.checkout(descriptor)?;
+        encoder.clear_buffer(&buffer, 0, None);
+        Ok(buffer)
+    }
+
+    /// A destination whose entire logical contents the job overwrites before
+    /// reading. This does not insert an unnecessary GPU clear.
+    /// Never use it for accumulators, partial writes or FFT padding.
+    pub fn output_buffer(
+        &mut self,
+        descriptor: &wgpu::BufferDescriptor<'_>,
+    ) -> Result<wgpu::Buffer, BufferWorkspaceError> {
+        self.checkout(descriptor)
+    }
+
+    fn checkout(
+        &mut self,
+        descriptor: &wgpu::BufferDescriptor<'_>,
+    ) -> Result<wgpu::Buffer, BufferWorkspaceError> {
+        if descriptor.mapped_at_creation
+            || descriptor.usage.contains(wgpu::BufferUsages::MAP_WRITE)
+            || descriptor.size == 0
+            || !descriptor.size.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
+        {
+            return Err(BufferWorkspaceError::InvalidDescriptor);
+        }
+        self.reserve()?;
+        let key = BufferKey {
+            size: descriptor.size,
+            usage: descriptor.usage | wgpu::BufferUsages::COPY_DST,
+        };
+        let buffer = match self.pool {
+            Some(pool) => pool.take_buffer(
+                &self.gpu.device,
+                key,
+                descriptor.label.unwrap_or("compute buffer"),
+            ),
+            None => self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: descriptor.label,
+                size: key.size,
+                usage: key.usage,
+                mapped_at_creation: false,
+            }),
+        };
+        Ok(self.retain(buffer))
+    }
+    /// Upload a complete word-aligned logical buffer; no CPU repacking allocation.
+    /// Shader-visible length is exact, including on a reused buffer.
+    pub fn upload(
+        &mut self,
+        label: &str,
+        contents: &[u8],
+        usage: wgpu::BufferUsages,
+    ) -> Result<wgpu::Buffer, BufferWorkspaceError> {
+        if contents.is_empty()
+            || !contents
+                .len()
+                .is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT as usize)
+            || usage.intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE)
+        {
+            return Err(BufferWorkspaceError::InvalidDescriptor);
+        }
+        self.reserve()?;
+        let key = BufferKey {
+            size: contents.len() as u64,
+            usage: usage | wgpu::BufferUsages::COPY_DST,
+        };
+        let buffer = match self.pool {
+            Some(pool) => pool.take_buffer(&self.gpu.device, key, label),
+            None => self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: key.size,
+                usage: key.usage,
+                mapped_at_creation: false,
+            }),
+        };
+        self.gpu.queue.write_buffer(&buffer, 0, contents);
+        Ok(self.retain(buffer))
+    }
+    /// Upload packed CPU/GPU words or pixels without an intermediate byte vector.
+    pub fn upload_slice<T: bytemuck::Pod>(
+        &mut self,
+        label: &str,
+        contents: &[T],
+        usage: wgpu::BufferUsages,
+    ) -> Result<wgpu::Buffer, BufferWorkspaceError> {
+        self.upload(label, bytemuck::cast_slice(contents), usage)
+    }
+
+    /// Overwrite a complete logical buffer leased by this workspace.
+    /// All earlier reads must have completed before rewriting per-dispatch data.
+    /// A queue upload must not be followed by an unsubmitted initialization clear.
+    pub fn overwrite_slice<T: bytemuck::Pod>(
+        &self,
+        buffer: &wgpu::Buffer,
+        contents: &[T],
+    ) -> Result<(), BufferWorkspaceError> {
+        let bytes = bytemuck::cast_slice(contents);
+        if bytes.len() as u64 != buffer.size()
+            || !buffer.usage().contains(wgpu::BufferUsages::COPY_DST)
+            || !bytes
+                .len()
+                .is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT as usize)
+        {
+            return Err(BufferWorkspaceError::InvalidDescriptor);
+        }
+        self.gpu.queue.write_buffer(buffer, 0, bytes);
+        Ok(())
+    }
+
+    /// Create an ordinary encoder. Initialization is explicit in `zeroed_buffer`.
+    pub fn encoder(
+        &mut self,
+        descriptor: &wgpu::CommandEncoderDescriptor<'_>,
+    ) -> wgpu::CommandEncoder {
+        self.gpu.device.create_command_encoder(descriptor)
+    }
+    /// Return this job's buffers after its last submitted use has completed.
+    ///
+    /// The caller must drop mapped views and unmap readbacks first, and must
+    /// neither retain an unsent encoder nor use cloned handles after this call.
+    /// If work failed or completion is uncertain, drop the workspace instead.
+    pub fn recycle(self) {
+        if let Some(pool) = self.pool {
+            for buffer in self.held {
+                pool.put(buffer);
+            }
+        }
+    }
+}
+
 /// Idle resources of one device, least recently returned first, at most `budget` bytes of them.
 pub struct ResourcePool<R> {
     idle: Mutex<Idle<R>>,
     budget: u64,
+    max_entries: usize,
 }
 
 struct Idle<R> {
@@ -114,6 +317,20 @@ impl<R: Pooled> ResourcePool<R> {
                 bytes: 0,
             }),
             budget,
+            max_entries: usize::MAX,
+        }
+    }
+
+    /// Bound both idle bytes and metadata. Zero entries disables idle retention.
+    /// Existing `new` keeps its byte-only policy for compatibility.
+    pub const fn with_limits(budget: u64, max_entries: usize) -> Self {
+        Self {
+            idle: Mutex::new(Idle {
+                slots: Vec::new(),
+                bytes: 0,
+            }),
+            budget,
+            max_entries,
         }
     }
 
@@ -136,11 +353,16 @@ impl<R: Pooled> ResourcePool<R> {
     /// returned ones beyond the budget; one larger than the whole budget is dropped.
     pub fn put(&self, resource: R) {
         let size = resource.bytes();
-        if size > self.budget {
+        if size > self.budget || self.max_entries == 0 {
             return;
         }
         let mut idle = self.idle();
-        while idle.bytes + size > self.budget && !idle.slots.is_empty() {
+        if idle.slots.try_reserve(1).is_err() {
+            return;
+        }
+        while (idle.bytes > self.budget - size || idle.slots.len() >= self.max_entries)
+            && !idle.slots.is_empty()
+        {
             let old = idle.slots.remove(0);
             idle.bytes -= old.bytes();
         }
@@ -338,6 +560,142 @@ mod tests {
 
     fn fake(key: u32, bytes: u64, id: u32) -> Fake {
         Fake { key, bytes, id }
+    }
+
+    #[test]
+    fn entry_limit_bounds_zero_byte_resources_and_zero_disables_pool() {
+        let pool = ResourcePool::with_limits(100, 2);
+        pool.put(fake(1, 0, 1));
+        pool.put(fake(1, 0, 2));
+        pool.put(fake(1, 0, 3));
+        assert_eq!(pool.idle_count(), (2, 0));
+        assert_eq!(pool.take(1).map(|value| value.id), Some(3));
+        assert_eq!(pool.take(1).map(|value| value.id), Some(2));
+        assert!(pool.take(1).is_none());
+        let disabled = ResourcePool::with_limits(100, 0);
+        disabled.put(fake(1, 1, 4));
+        assert_eq!(disabled.idle_count(), (0, 0));
+    }
+
+    #[test]
+    fn budgets_near_u64_max_do_not_overflow_return_accounting() {
+        let pool = ResourcePool::with_limits(u64::MAX, 4);
+        pool.put(fake(1, u64::MAX - 10, 1));
+        pool.put(fake(2, 20, 2));
+        assert_eq!(pool.idle_count(), (1, 20));
+        assert!(pool.take(1).is_none());
+    }
+
+    /// Reusing dirty storage must clear in the supplied encoder before copy/read;
+    /// incomplete jobs must not put resources back. This pool belongs only to this
+    /// test, so other GPU tests cannot change the accounting or ordering.
+    #[cfg(feature = "wgpu")]
+    #[test]
+    #[ignore = "requires a compute GPU; run explicitly on the validation machine"]
+    fn workspace_reuse_clears_dirty_storage_and_recycles_only_after_completion() {
+        static POOL: ResourcePool<wgpu::Buffer> = ResourcePool::with_limits(1024, 4);
+        let gpu = crate::compute_device().expect("compute device");
+        let mut workspace = BufferWorkspace {
+            gpu,
+            pool: Some(&POOL),
+            held: Vec::new(),
+        };
+        let source = workspace
+            .upload_slice(
+                "pool dirty",
+                &[7_u32; 64],
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            )
+            .expect("upload");
+        let descriptor = wgpu::BufferDescriptor {
+            label: Some("pool readback"),
+            size: 256,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        };
+        let readback = workspace.output_buffer(&descriptor).expect("readback");
+        let mut encoder = workspace.encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("pool dirty copy"),
+        });
+        encoder.copy_buffer_to_buffer(&source, 0, &readback, 0, 256);
+        let submitted = crate::submit(&gpu.queue, "pool dirty copy", [encoder.finish()]);
+        crate::wait(&gpu.device, &submitted).expect("completion");
+        let verify = |buffer: &wgpu::Buffer, expected: u32| {
+            let slice = buffer.slice(..256);
+            crate::map_read(&gpu.device, &slice).expect("map");
+            let mapped = slice.get_mapped_range().expect("mapped range");
+            assert_eq!(mapped.len(), 256);
+            assert!(
+                mapped
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|word| u32::from_ne_bytes(*word) == expected)
+            );
+            drop(mapped);
+            buffer.unmap();
+        };
+        verify(&readback, 7);
+        drop(source);
+        drop(readback);
+        workspace.recycle();
+        assert_eq!(POOL.idle_count(), (2, 512));
+
+        let mut workspace = BufferWorkspace {
+            gpu,
+            pool: Some(&POOL),
+            held: Vec::new(),
+        };
+        let mut encoder = workspace.encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("pool clear copy"),
+        });
+        let source = workspace
+            .zeroed_buffer(
+                &mut encoder,
+                &wgpu::BufferDescriptor {
+                    label: Some("pool reused storage"),
+                    size: 256,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                },
+            )
+            .expect("reused storage");
+        let readback = workspace
+            .output_buffer(&descriptor)
+            .expect("reused readback");
+        assert_eq!(POOL.idle_count(), (0, 0));
+        encoder.copy_buffer_to_buffer(&source, 0, &readback, 0, 256);
+        let submitted = crate::submit(&gpu.queue, "pool clear copy", [encoder.finish()]);
+        crate::wait(&gpu.device, &submitted).expect("completion");
+        verify(&readback, 0);
+        drop(source);
+        drop(readback);
+        workspace.recycle();
+        assert_eq!(POOL.idle_count(), (2, 512));
+
+        let mut incomplete = BufferWorkspace {
+            gpu,
+            pool: Some(&POOL),
+            held: Vec::new(),
+        };
+        let buffer = incomplete.output_buffer(&descriptor).expect("checkout");
+        drop(buffer);
+        drop(incomplete);
+        assert_eq!(
+            POOL.idle_count(),
+            (1, 256),
+            "no automatic return without proof"
+        );
+        assert!(
+            POOL.take(BufferKey {
+                size: 256,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+            })
+            .is_some()
+        );
+        assert_eq!(POOL.idle_count(), (0, 0));
     }
 
     /// A take finds only its key, the most recently returned first; nothing of another key.

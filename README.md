@@ -15,6 +15,18 @@ One-stop GPU information crate. Two complementary APIs in one place:
 
 (Was two crates — `wgpu-info-rs` + `gpu-mem` — now merged into one.)
 
+## Shared compute buffers
+
+Effects using the canonical `compute_device()` can share `COMPUTE_BUFFERS` instead
+of multiplying independent idle budgets. Its limit is 512 MiB/256 idle buffers;
+active work still needs admission. `BufferWorkspace` holds a job's exact-size buffers
+and recycles only after explicit completion, successful device error scopes and
+unmapped readbacks. Dropping a failed/incomplete workspace does not recycle it.
+Use explicit encoder clears for accumulators, full-overwrite output buffers for
+complete writers, and typed uploads to avoid temporary byte vectors. See the
+[ownership contract](AGENTS.md#shared-compute-buffer-workspace-2026-10-07).
+This source checkpoint has no new compile/hardware/performance receipt.
+
 ## Which module do I want?
 
 | Need | Module | Cost per call | Notes |

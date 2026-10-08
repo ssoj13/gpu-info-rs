@@ -7,6 +7,22 @@ published to crates.io, so consumers pin it by git ref rather than by version.
 
 ## [Unreleased]
 
+### Shared compute buffers (2026-10-07, source checkpoint)
+
+- Add `ResourcePool::with_limits` with a byte and entry ceiling, fallible metadata
+  retention and overflow-safe return accounting. The existing byte-only constructor
+  preserves its behavior. New pure tests cover zero-sized entry growth and u64 limits.
+- Add `COMPUTE_BUFFERS`: one 512-MiB/256-entry idle buffer pool for the canonical
+  `compute_device()`, separate from application/shared-device resources and active
+  job admission. `BufferWorkspace` gates reuse on explicit completed-job recycling;
+  incomplete jobs drop their handles. Foreign devices retain unpooled allocations.
+- Provide exact logical buffers, explicit encoder clears, full-overwrite destinations
+  and typed upload/overwrite without intermediate byte vectors. MAP_WRITE is refused;
+  readback views must be dropped and unmapped, and enclosing device error scopes must
+  succeed before recycling. Add an ignored hardware dirty-buffer/clear/recycle oracle.
+- Source review and standalone formatting only. No builds/tests or GPU acceptance ran
+  for this checkpoint under the operator's stop-build instruction.
+
 ### Documentation (2026-10-07)
 
 - Clarify the native Vulkan consumer predicate, the opaque `VulkanShared` API on other

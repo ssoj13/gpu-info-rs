@@ -1,5 +1,23 @@
 # Integrating `gpu-info-rs` — guide for LLM coding agents
 
+## Shared compute buffer workspace (2026-10-07)
+
+`COMPUTE_BUFFERS` is exclusively for the exact canonical `compute_device()`:
+512 MiB/256 idle entries, shared across effects. It is not an active-VRAM admission
+budget and must never receive shared_device/application/external-device buffers.
+`BufferWorkspace::new` checks device identity and falls back to ordinary allocation
+on a foreign device. Create/use buffers inside device error scopes; after all submitted
+uses complete, drop map views, unmap, close scopes successfully, then `recycle`.
+No retained clone may be used afterward; no unsent encoder may reference it.
+Dropping an incomplete/failed workspace never returns resources to the pool.
+
+`zeroed_buffer` encodes its clear immediately in a same-device encoder, ordered before
+first read/accumulation. `output_buffer` requires a full logical overwrite before read;
+partial writers/padded FFT grids need explicit clear. `upload_slice` and
+`overwrite_slice` use Pod bytes directly; uniform rewrites require earlier reads to
+have completed. MAP_WRITE is refused. The pure accounting and ignored hardware tests
+are added but unexecuted at this source checkpoint; no warm-allocation claim follows.
+
 ## Size RAM / VRAM budgets through `gpu_info::budget` (2026-10-01)
 
 ONE home for the budget formulas (7 projects had 3 policies). RAM: `ram_budget_from(total, avail, policy, fraction,

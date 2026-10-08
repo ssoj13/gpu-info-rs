@@ -88,7 +88,7 @@ pub mod wait;
 /// and the `Gate` are wgpu-free; the buffer and texture keys and their pools need `wgpu`.
 pub mod pool;
 #[cfg(feature = "wgpu")]
-pub use pool::{BufferKey, TextureKey};
+pub use pool::{BufferKey, BufferWorkspace, BufferWorkspaceError, COMPUTE_BUFFERS, TextureKey};
 pub use pool::{Gate, OwnedPermit, Permit, Pooled, ResourcePool};
 /// Windows RAM via `GlobalMemoryStatusEx` (a syscall, not a `wmic` process spawn) — see [`win_mem`].
 #[cfg(windows)]
