@@ -360,12 +360,24 @@ impl<R: Pooled> ResourcePool<R> {
         if idle.slots.try_reserve(1).is_err() {
             return;
         }
-        while (idle.bytes > self.budget - size || idle.slots.len() >= self.max_entries)
-            && !idle.slots.is_empty()
-        {
+        // Driver-backed destruction may wait for other queues. Never run it
+        // under the metadata lock, and bound retries to the initial idle count
+        // so concurrent returns cannot keep this caller evicting indefinitely.
+        let attempts = idle.slots.len();
+        for _ in 0..attempts {
+            if idle.bytes <= self.budget - size && idle.slots.len() < self.max_entries {
+                break;
+            }
             let old = idle.slots.remove(0);
             idle.bytes -= old.bytes();
+            drop(idle);
+            drop(old);
+            idle = self.idle();
         }
+        if idle.bytes > self.budget - size || idle.slots.len() >= self.max_entries {
+            return;
+        }
+        if idle.slots.try_reserve(1).is_err() { return; }
         idle.bytes += size;
         idle.slots.push(resource);
     }
@@ -560,6 +572,34 @@ mod tests {
 
     fn fake(key: u32, bytes: u64, id: u32) -> Fake {
         Fake { key, bytes, id }
+    }
+
+    #[test]
+    fn eviction_destroys_resources_outside_metadata_lock() {
+        use std::sync::{Arc, Weak, atomic::{AtomicBool, Ordering}};
+        struct Probe {
+            pool: Weak<ResourcePool<Probe>>,
+            unlocked: Arc<AtomicBool>,
+        }
+        impl Pooled for Probe {
+            type Key = ();
+            fn key(&self) {}
+            fn bytes(&self) -> u64 { 1 }
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                if let Some(pool) = self.pool.upgrade() {
+                    self.unlocked.store(pool.idle.try_lock().is_ok(), Ordering::Relaxed);
+                }
+            }
+        }
+        let pool = Arc::new(ResourcePool::with_limits(1, 1));
+        let unlocked = Arc::new(AtomicBool::new(false));
+        let resource = || Probe { pool: Arc::downgrade(&pool), unlocked: unlocked.clone() };
+        pool.put(resource());
+        pool.put(resource());
+        assert!(unlocked.load(Ordering::Relaxed));
+        assert_eq!(pool.idle_count(), (1, 1));
     }
 
     #[test]

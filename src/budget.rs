@@ -348,8 +348,11 @@ mod tests {
             Ok(2 * GIB)
         );
         let (total, avail) = ram().expect("OS memory query");
-        let b = ram_budget(Policy::Min, 0.5, 0).expect("budget");
+        let b = ram_budget_from(total, avail, Policy::Min, 0.5, 0);
         assert!(b <= total / 2 && b <= avail);
+        // A second live OS query can observe a different available-RAM value.
+        // The formula is checked on one snapshot; this separately checks the API.
+        assert!(ram_budget(Policy::Min, 0.5, 0).is_ok());
     }
 
     #[test]

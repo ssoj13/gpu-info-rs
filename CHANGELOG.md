@@ -1,11 +1,31 @@
 # Changelog
 
+## 2026-10-08
+
+- Validated ResourcePool eviction outside its metadata lock and bounded rechecks.
+- Fixed the RAM-budget smoke to use one snapshot for formula assertions; a separate
+  OS-query smoke no longer races changes in available RAM during parallel builds.
+- Final gates: 49 release library tests passed (15 separately ignored), explicit
+  WGPU workspace reuse/dirty-clear/completion test passed, strict all-target/
+  all-feature Clippy passed. These are local Windows receipts.
+
+
 All notable changes to `gpu-info-rs` are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate is not
 published to crates.io, so consumers pin it by git ref rather than by version.
 
 ## [Unreleased]
+
+### Pool retirement and dependency source update (2026-10-07, unverified)
+
+- Destroy evicted ResourcePool resources outside the metadata mutex. Retain bounded
+  retries and recheck capacity before promotion; add an unexecuted destructor-lock
+  probe. Buffer completion/unmap/scope requirements remain unchanged.
+- Refresh compatible dependencies to wgpu 30.0.1 and current Git heads.
+  This follow-up remains uncommitted/unpushed; b1780cd is the published pool checkpoint.
+  No build/test/hardware receipt is added. The operator deferred intermediate gates.
+
 
 ### Shared compute buffers (2026-10-07, source checkpoint)
 

@@ -1,5 +1,14 @@
 # Integrating `gpu-info-rs` — guide for LLM coding agents
 
+Pool integration (2026-10-08): ResourcePool return/eviction drops retired
+device resources outside its metadata mutex, with bounded retries and capacity
+rechecks after reacquisition. The destructor-lock probe passed. Cargo.lock uses
+latest compatible dependencies including wgpu 30.0.1. Final release library
+tests: 49 passed, 15 separately ignored; the explicit compute-workspace GPU
+reuse/dirty-clear/completion gate passed. Strict all-target/all-feature Clippy
+passed. The OS RAM smoke checks its formula on one snapshot rather than
+comparing independently changing live readings.
+
 ## Shared compute buffer workspace (2026-10-07)
 
 `COMPUTE_BUFFERS` is exclusively for the exact canonical `compute_device()`:
