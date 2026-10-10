@@ -141,16 +141,12 @@ mod imp {
             // `vkGetPhysicalDeviceMemoryProperties2` is core in 1.1 and the budget struct needs the extension: without
             // them the chain would be ignored and read back zeros, so say "unreported" here instead.
             let version = unsafe { instance.get_physical_device_properties(raw_phys) }.api_version;
-            if vk::api_version_major(version) == 1 && vk::api_version_minor(version) < 1 {
-                return None;
-            }
             let extensions =
                 unsafe { instance.enumerate_device_extension_properties(raw_phys) }.ok()?;
-            let supported = extensions.iter().any(|e| {
-                e.extension_name_as_c_str()
-                    .is_ok_and(|name| name == ash::ext::memory_budget::NAME)
-            });
-            if !supported {
+            let names = extensions
+                .iter()
+                .filter_map(|e| e.extension_name_as_c_str().ok()?.to_str().ok());
+            if !super::budget_chainable(version, names) {
                 return None;
             }
             Some(Self {
@@ -347,6 +343,26 @@ pub fn vram_budget_bytes(adapter: &wgpu::Adapter) -> Option<u64> {
         let _ = adapter;
         None
     }
+}
+
+/// Whether `VkPhysicalDeviceMemoryBudgetPropertiesEXT` may be chained to `vkGetPhysicalDeviceMemoryProperties2` for a
+/// device of Vulkan `api_version` that lists `extensions`: the query is core from 1.1 and the budget struct needs
+/// `VK_EXT_memory_budget`; without either the chain would be ignored and read back zeros. Pure, so it is tested on
+/// every host; the Linux querier asks it once when it is built.
+#[cfg_attr(
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        test
+    )),
+    allow(dead_code)
+)]
+fn budget_chainable<'a>(api_version: u32, mut extensions: impl Iterator<Item = &'a str>) -> bool {
+    // VK_MAKE_API_VERSION: variant 31..29, major 28..22, minor 21..12, patch 11..0.
+    let (major, minor) = ((api_version >> 22) & 0x7f, (api_version >> 12) & 0x3ff);
+    (major > 1 || (major == 1 && minor >= 1))
+        && extensions.any(|name| name == "VK_EXT_memory_budget")
 }
 
 /// The physical identity of an adapter, from the driver, computed once per [`AdapterKey`].
@@ -631,6 +647,67 @@ mod watch_tests {
         // A later failure is announced again.
         assert_eq!(watch.budget_with(&gpu(0), || None), None);
         assert!(watch.state.lock().expect("lock").failing);
+    }
+
+    /// The Linux budget query chains its struct only on Vulkan >= 1.1 with the extension listed. RED: the version
+    /// test dropped (1.0 passes) or the extension name not required.
+    #[test]
+    fn the_budget_struct_is_chained_only_where_it_is_supported() {
+        let v = |major: u32, minor: u32| (major << 22) | (minor << 12);
+        let with = ["VK_KHR_swapchain", "VK_EXT_memory_budget"];
+        assert!(super::budget_chainable(v(1, 1), with.into_iter()));
+        assert!(super::budget_chainable(v(1, 3), with.into_iter()));
+        assert!(super::budget_chainable(v(2, 0), with.into_iter()));
+        assert!(!super::budget_chainable(v(1, 0), with.into_iter()), "1.0");
+        assert!(
+            !super::budget_chainable(v(1, 3), ["VK_KHR_swapchain"].into_iter()),
+            "no extension"
+        );
+        assert!(!super::budget_chainable(v(1, 3), [].into_iter()));
+    }
+
+    /// Adapters of one instance enumerated twice and of two instances are the same card: their physical identity is
+    /// equal and each reports the budget (keys of distinct handles may differ, which only costs the watch a re-read -
+    /// documented on [`AdapterKey`]); an identity-less backend would show as `Unknown`, which this machine's must not.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn the_same_card_has_the_same_identity_across_enumerations_and_instances() {
+        let adapters = || {
+            let instance = wgpu::Instance::new(crate::shared_instance_descriptor());
+            pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()))
+        };
+        let phys = |adapter: &wgpu::Adapter| match AdapterKey::of(adapter).0 {
+            Repr::Adapter(_, phys) => phys,
+            Repr::Test(_) => unreachable!("a real adapter"),
+        };
+        let (first, second) = (adapters(), adapters());
+        let real = |adapter: &&wgpu::Adapter| {
+            adapter.get_info().device_type != wgpu::DeviceType::Cpu
+                && phys(adapter) != super::PhysId::Unknown
+        };
+        let a = first.iter().find(real).expect("a hardware adapter");
+        let b = second
+            .iter()
+            .find(|candidate| phys(candidate) == phys(a))
+            .expect("the same card in the second instance");
+        assert_eq!(phys(a), phys(b));
+        let watch = VramWatch::new("test", Duration::ZERO);
+        let device = |adapter: &wgpu::Adapter| {
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("device")
+        };
+        for adapter in [a, b] {
+            let (device, _queue) = device(adapter);
+            let budget = watch.budget(super::GpuVramContext {
+                adapter,
+                device: &device,
+            });
+            assert!(
+                budget.is_some_and(|bytes| bytes > 0),
+                "{:?}",
+                AdapterKey::of(adapter)
+            );
+        }
     }
 
     /// A real adapter has a physical identity (LUID on Windows, UUID on Linux), two keys of it are equal, and its
