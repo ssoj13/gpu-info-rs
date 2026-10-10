@@ -8,6 +8,13 @@
 - `AdapterKey` (`vram.rs`): the identity `VramWatch` keys its cache by - the wgpu adapter handle, so two identical
   cards are told apart and a cache hit allocates nothing (no `get_info`, no `format!` per call).
   `VramWatch::budget_with` takes it instead of a text key; `budget(ctx)` is source-compatible.
+- `AdapterKey` is instance-safe: the adapter handle AND the driver's physical identity (LUID from DX12 or Vulkan
+  `VkPhysicalDeviceIDProperties`, else the device UUID), computed once in `AdapterKey::of`. Adapters of two
+  `wgpu::Instance`s that share a wgpu id are told apart; backends reporting no identity (Metal, GL) compare the handle
+  only (documented).
+- Windows: the DXGI adapter of a budget query is matched by LUID, not by name, so two identical cards no longer get the
+  first card's budget; no LUID means unreported.
+- Linux: `VK_EXT_memory_budget` support and Vulkan >= 1.1 are checked before the budget struct is chained.
 - Linux/Android/FreeBSD: the budget is the live `VK_EXT_memory_budget` figure of the largest device-local heap (what
   other processes use is subtracted), as DXGI's Budget on Windows; it was the static sum of all device-local heaps.
   No extension: `None` (unreported), never the static size.

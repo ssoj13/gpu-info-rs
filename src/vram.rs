@@ -14,8 +14,8 @@
 //!
 //! # Platform matrix
 //!
-//! - **Windows** — DXGI `IDXGIAdapter3::QueryVideoMemoryInfo` (adapter name-match;
-//!   backend-agnostic — works when wgpu uses Vulkan too). VERIFIED.
+//! - **Windows** — DXGI `IDXGIAdapter3::QueryVideoMemoryInfo`, the adapter matched by LUID
+//!   (backend-agnostic — works when wgpu uses Vulkan too). VERIFIED.
 //! - **Linux** — Vulkan `VK_EXT_memory_budget` via `Adapter::as_hal`.
 //! - **macOS** — Metal `MTLDevice` via `Device::as_hal` (wgpu-hal 29 exposes
 //!   `raw_device()` on the HAL **Device**, not the Adapter). Apple Silicon reports
@@ -43,11 +43,10 @@ pub struct VramInfo {
 // ===========================================================================
 #[cfg(windows)]
 mod imp {
-    use super::{GpuVramContext, VramInfo};
+    use super::{GpuVramContext, VramInfo, phys_id};
     use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS,
-        DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO, IDXGIAdapter3,
-        IDXGIFactory4,
+        CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
+        DXGI_QUERY_VIDEO_MEMORY_INFO, IDXGIAdapter3, IDXGIFactory4,
     };
     use windows::core::Interface;
 
@@ -55,44 +54,33 @@ mod imp {
         adapter: IDXGIAdapter3,
     }
 
-    fn match_dxgi_adapter(want: &str) -> Option<IDXGIAdapter3> {
+    /// The DXGI adapter with this LUID (`VkPhysicalDeviceIDProperties::deviceLUID` / `DXGI_ADAPTER_DESC1`). The LUID
+    /// is unique per adapter in a boot session, so two identical cards are told apart; a name is not.
+    fn match_dxgi_adapter(luid: u64) -> Option<IDXGIAdapter3> {
         let factory: IDXGIFactory4 =
             unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }.ok()?;
-
-        let mut best: Option<IDXGIAdapter3> = None;
-        let mut first_hw: Option<IDXGIAdapter3> = None;
         let mut i = 0u32;
-        loop {
-            let base = match unsafe { factory.EnumAdapters1(i) } {
-                Ok(a) => a,
-                Err(_) => break,
-            };
+        while let Ok(base) = unsafe { factory.EnumAdapters1(i) } {
             i += 1;
             let Ok(desc) = (unsafe { base.GetDesc1() }) else {
                 continue;
             };
-            if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
-                continue;
-            }
-            let Ok(adapter3) = base.cast::<IDXGIAdapter3>() else {
-                continue;
-            };
-            if first_hw.is_none() {
-                first_hw = Some(adapter3.clone());
-            }
-            let len = desc
-                .Description
-                .iter()
-                .position(|&c| c == 0)
-                .unwrap_or(desc.Description.len());
-            let name = String::from_utf16_lossy(&desc.Description[..len]);
-            if !want.is_empty() && name.contains(want) {
-                best = Some(adapter3);
-                break;
+            let found = (u64::from(desc.AdapterLuid.HighPart as u32) << 32)
+                | u64::from(desc.AdapterLuid.LowPart);
+            if found == luid {
+                return base.cast::<IDXGIAdapter3>().ok();
             }
         }
+        None
+    }
 
-        best.or(first_hw)
+    /// The LUID of `adapter`, `None` when neither backend reports one (the budget is then unreported, never another
+    /// card's).
+    fn luid_of(adapter: &wgpu::Adapter) -> Option<u64> {
+        match phys_id(adapter) {
+            super::PhysId::Luid(luid) => Some(luid),
+            super::PhysId::Uuid(_) | super::PhysId::Unknown => None,
+        }
     }
 
     fn query_local_segment(adapter: &IDXGIAdapter3) -> Option<VramInfo> {
@@ -107,8 +95,7 @@ mod imp {
 
     impl VramQuerier {
         pub fn new(ctx: GpuVramContext<'_>) -> Option<Self> {
-            let want = ctx.adapter.get_info().name;
-            let adapter = match_dxgi_adapter(&want)?;
+            let adapter = match_dxgi_adapter(luid_of(ctx.adapter)?)?;
             Some(Self { adapter })
         }
 
@@ -118,8 +105,7 @@ mod imp {
     }
 
     pub(super) fn vram_budget_adapter(adapter: &wgpu::Adapter) -> Option<u64> {
-        let want = adapter.get_info().name;
-        let dxgi = match_dxgi_adapter(&want)?;
+        let dxgi = match_dxgi_adapter(luid_of(adapter)?)?;
         query_local_segment(&dxgi).map(|v| v.budget)
     }
 
@@ -152,6 +138,21 @@ mod imp {
             let raw_phys = hal_adapter.raw_physical_device();
             let shared = hal_adapter.shared_instance();
             let instance = shared.raw_instance().clone();
+            // `vkGetPhysicalDeviceMemoryProperties2` is core in 1.1 and the budget struct needs the extension: without
+            // them the chain would be ignored and read back zeros, so say "unreported" here instead.
+            let version = unsafe { instance.get_physical_device_properties(raw_phys) }.api_version;
+            if vk::api_version_major(version) == 1 && vk::api_version_minor(version) < 1 {
+                return None;
+            }
+            let extensions =
+                unsafe { instance.enumerate_device_extension_properties(raw_phys) }.ok()?;
+            let supported = extensions.iter().any(|e| {
+                e.extension_name_as_c_str()
+                    .is_ok_and(|name| name == ash::ext::memory_budget::NAME)
+            });
+            if !supported {
+                return None;
+            }
             Some(Self {
                 instance,
                 physical_device: raw_phys,
@@ -348,25 +349,95 @@ pub fn vram_budget_bytes(adapter: &wgpu::Adapter) -> Option<u64> {
     }
 }
 
-/// The identity of a GPU for a [`VramWatch`]: the wgpu adapter handle itself. Two identical cards are two adapters,
-/// whatever vendor, device id, name or bus they report, and the comparison and the clone (a reference count) allocate
-/// nothing, so a cache hit costs no allocation. Build it with [`Self::of`].
+/// The physical identity of an adapter, from the driver, computed once per [`AdapterKey`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PhysId {
+    /// The adapter's LUID (Windows; `VkPhysicalDeviceIDProperties::deviceLUID` or `DXGI_ADAPTER_DESC1`), unique per
+    /// adapter in a boot session.
+    Luid(u64),
+    /// `VkPhysicalDeviceIDProperties::deviceUUID` (Vulkan without a valid LUID, i.e. Linux).
+    Uuid([u8; 16]),
+    /// The backend reports none (Metal, GL).
+    Unknown,
+}
+
+/// The identity of a GPU for a [`VramWatch`]: the wgpu adapter handle AND the driver's physical identity.
+///
+/// **Contract:** wgpu compares adapters by an id that is unique inside one `wgpu::Instance`, so adapters of two
+/// instances can share an id; the physical identity (LUID or UUID) tells those apart (two instances of the same
+/// physical card compare equal, which is right: it is one budget). Two identical cards differ in the physical
+/// identity whatever name, vendor or device id they report. Where the backend reports none ([`PhysId::Unknown`])
+/// only the handle compares, so keys of different instances on such a backend may collide: use one instance per
+/// watch there. Build it once with [`Self::of`]; comparing and cloning allocate nothing, so a cache hit costs no
+/// allocation.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AdapterKey(Repr);
 
 #[derive(Clone, PartialEq, Eq)]
 enum Repr {
-    Adapter(wgpu::Adapter),
+    Adapter(wgpu::Adapter, PhysId),
     /// A stand-in for tests, which have no GPU.
     #[cfg(test)]
     Test(u32),
 }
 
 impl AdapterKey {
-    /// The key of `adapter`.
+    /// The key of `adapter` (queries the driver for its physical identity: build it once, not per call).
     pub fn of(adapter: &wgpu::Adapter) -> Self {
-        Self(Repr::Adapter(adapter.clone()))
+        Self(Repr::Adapter(adapter.clone(), phys_id(adapter)))
     }
+}
+
+/// The physical identity of `adapter`: the DX12 adapter's LUID, else the Vulkan device's LUID or UUID.
+fn phys_id(adapter: &wgpu::Adapter) -> PhysId {
+    #[cfg(windows)]
+    if let Some(luid) = dx12_luid(adapter) {
+        return PhysId::Luid(luid);
+    }
+    #[cfg(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd"
+    ))]
+    if let Some(id) = vulkan_id(adapter) {
+        return id;
+    }
+    let _ = adapter;
+    PhysId::Unknown
+}
+
+#[cfg(windows)]
+fn dx12_luid(adapter: &wgpu::Adapter) -> Option<u64> {
+    let hal = unsafe { adapter.as_hal::<wgpu::hal::api::Dx12>() }?;
+    let desc = unsafe { hal.raw_adapter().GetDesc1() }.ok()?;
+    Some((u64::from(desc.AdapterLuid.HighPart as u32) << 32) | u64::from(desc.AdapterLuid.LowPart))
+}
+
+#[cfg(any(
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd"
+))]
+fn vulkan_id(adapter: &wgpu::Adapter) -> Option<PhysId> {
+    use ash::vk;
+    let hal = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }?;
+    let phys = hal.raw_physical_device();
+    let instance = hal.shared_instance().raw_instance();
+    // `vkGetPhysicalDeviceProperties2` is core in Vulkan 1.1.
+    let version = unsafe { instance.get_physical_device_properties(phys) }.api_version;
+    if vk::api_version_major(version) == 1 && vk::api_version_minor(version) < 1 {
+        return None;
+    }
+    let mut id = vk::PhysicalDeviceIDProperties::default();
+    let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut id);
+    unsafe { instance.get_physical_device_properties2(phys, &mut props) };
+    Some(if id.device_luid_valid == vk::TRUE {
+        PhysId::Luid(u64::from_le_bytes(id.device_luid))
+    } else {
+        PhysId::Uuid(id.device_uuid)
+    })
 }
 
 /// Names the adapter in the watch's log lines (only logged on a failure or a recovery, so the info strings may be
@@ -374,12 +445,12 @@ impl AdapterKey {
 impl std::fmt::Debug for AdapterKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.0 {
-            Repr::Adapter(adapter) => {
+            Repr::Adapter(adapter, phys) => {
                 let info = adapter.get_info();
                 write!(
                     f,
-                    "{:?} {:04x}:{:04x} {} (bus {})",
-                    info.backend, info.vendor, info.device, info.name, info.device_pci_bus_id
+                    "{:?} {:04x}:{:04x} {} ({phys:?})",
+                    info.backend, info.vendor, info.device, info.name
                 )
             }
             #[cfg(test)]
@@ -404,7 +475,7 @@ impl std::fmt::Debug for AdapterKey {
 /// **Reentrancy:** the query runs while the watch's lock is held. It must not call the watch ([`Self::budget`] or
 /// [`Self::budget_with`]) - that deadlocks.
 ///
-/// **Where used:** `ofx-runtime`'s GPU renderer (its shared idle allowance) and `ofx-finish`'s retained jobs.
+/// **Where used:** consumers whose idle pool quota follows the OS budget, e.g. `ofx-runtime`'s GPU renderer.
 pub struct VramWatch {
     label: &'static str,
     every: std::time::Duration,
@@ -560,5 +631,20 @@ mod watch_tests {
         // A later failure is announced again.
         assert_eq!(watch.budget_with(&gpu(0), || None), None);
         assert!(watch.state.lock().expect("lock").failing);
+    }
+
+    /// A real adapter has a physical identity (LUID on Windows, UUID on Linux), two keys of it are equal, and its
+    /// budget is reported through the identity-matched query. RED: matching the DXGI adapter by name, or `Unknown`.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn a_real_adapter_is_identified_and_reports_its_budget() {
+        let gpu = crate::compute_device().expect("a GPU");
+        let (a, b) = (AdapterKey::of(&gpu.adapter), AdapterKey::of(&gpu.adapter));
+        assert_eq!(a, b);
+        let Repr::Adapter(_, phys) = &a.0 else {
+            panic!("a real key");
+        };
+        assert_ne!(*phys, super::PhysId::Unknown, "{a:?}");
+        assert!(super::vram_budget_bytes(&gpu.adapter).is_some_and(|bytes| bytes > 0));
     }
 }

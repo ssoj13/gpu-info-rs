@@ -226,7 +226,7 @@ mod tests {
             limits.tiling_reason_rows(4093, 3, 12280),
             Some(TilingReason::BufferBinding)
         );
-        // Four bytes per pixel would have refused the two rows (16372 x 2 > 24560 is false, but 3 rows is the edge).
+        // A rounded-up four bytes per pixel would refuse two rows: 16372 x 2 = 32744 > 24560.
         assert_eq!(limits.tiling_reason(4093, 2, 3), None);
         assert_eq!(
             limits.tiling_reason(4093, 2, 4),
