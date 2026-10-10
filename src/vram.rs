@@ -350,6 +350,49 @@ pub fn vram_budget_bytes(adapter: &wgpu::Adapter) -> Option<u64> {
     }
 }
 
+/// The identity of a GPU as far as wgpu tells it: backend, vendor id, device id, PCI bus id and name. Two identical
+/// cards differ in the bus id (empty where the backend reports none), so a [`VramWatch`] never answers one card's
+/// reading for the other. Compute it once per adapter ([`Self::of`]) and reuse it: it owns two strings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdapterKey {
+    backend: wgpu::Backend,
+    vendor: u32,
+    device: u32,
+    pci_bus: String,
+    name: String,
+}
+
+impl AdapterKey {
+    /// A key from its parts (what [`Self::of`] reads from the adapter; tests build them directly).
+    pub fn new(
+        backend: wgpu::Backend,
+        vendor: u32,
+        device: u32,
+        pci_bus: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        Self {
+            backend,
+            vendor,
+            device,
+            pci_bus: pci_bus.into(),
+            name: name.into(),
+        }
+    }
+
+    /// The key of `adapter`.
+    pub fn of(adapter: &wgpu::Adapter) -> Self {
+        let info = adapter.get_info();
+        Self::new(
+            info.backend,
+            info.vendor,
+            info.device,
+            info.device_pci_bus_id,
+            info.name,
+        )
+    }
+}
+
 /// A rate-limited reading of the OS VRAM budget of ONE device for a consumer whose idle quota follows it (a resource
 /// pool's `set_budget`).
 ///
@@ -358,9 +401,10 @@ pub fn vram_budget_bytes(adapter: &wgpu::Adapter) -> Option<u64> {
 /// one (the platform reports none) is cached the same way - never remembered as a permanent zero - and logged once
 /// (`log::warn!`, prefixed with the watch's `label`); the first reading after a failure is logged once as a recovery.
 ///
-/// **One device:** the cache belongs to the adapter that was asked ([`Self::budget`] keys it by vendor, device id and
-/// name). Asked about another adapter, the watch forgets its reading and queries at once, so a cached figure of one
-/// GPU is never answered for another.
+/// **One device:** the cache belongs to the adapter that was asked ([`AdapterKey`]: backend, vendor, device, PCI bus
+/// id, name). Asked about another adapter, the watch forgets its reading and queries at once, so a cached figure of
+/// one GPU is never answered for another; a consumer that watches one adapter computes its key once and calls
+/// [`Self::budget_with`]. Alternating two adapters through one watch re-reads every time: give each its own.
 ///
 /// **Reentrancy:** the query runs while the watch's lock is held. It must not call the watch ([`Self::budget`] or
 /// [`Self::budget_with`]) - that deadlocks.
@@ -375,7 +419,7 @@ pub struct VramWatch {
 /// The last reading of a [`VramWatch`].
 struct WatchState {
     /// The device the reading is of.
-    device: Option<String>,
+    device: Option<AdapterKey>,
     budget: Option<u64>,
     at: Option<std::time::Instant>,
     /// The last reading failed (and said so): a success logs the recovery.
@@ -410,31 +454,36 @@ impl VramWatch {
     /// The OS VRAM budget of the context's device in bytes, read again when the last reading is older than the
     /// interval or was of another adapter; `None` while the platform reports none.
     pub fn budget(&self, ctx: GpuVramContext<'_>) -> Option<u64> {
-        let info = ctx.adapter.get_info();
-        let device = format!("{:04x}:{:04x}:{}", info.vendor, info.device, info.name);
-        self.budget_with(&device, || vram_budget_from_context(ctx))
+        self.budget_with(&AdapterKey::of(ctx.adapter), || {
+            vram_budget_from_context(ctx)
+        })
     }
 
-    /// [`Self::budget`] for the device named `device` with the query supplied (a test drives the rate limit, the
-    /// re-keying and the failure path with it). `query` must not call this watch.
-    pub fn budget_with(&self, device: &str, query: impl FnOnce() -> Option<u64>) -> Option<u64> {
+    /// [`Self::budget`] for the adapter `device` (computed once by the caller: [`AdapterKey::of`]) with the query
+    /// supplied (a test drives the rate limit, the re-keying and the failure path with it). `query` must not call this
+    /// watch.
+    pub fn budget_with(
+        &self,
+        device: &AdapterKey,
+        query: impl FnOnce() -> Option<u64>,
+    ) -> Option<u64> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let same = state.device.as_deref() == Some(device);
+        let same = state.device.as_ref() == Some(device);
         if same && state.at.is_some_and(|at| at.elapsed() < self.every) {
             return state.budget;
         }
         if !same {
-            state.device = Some(device.to_owned());
+            state.device = Some(device.clone());
             state.failing = false;
         }
         state.budget = query();
         match (state.budget, state.failing) {
             (None, false) => {
                 log::warn!(
-                    "{}: the OS reports no VRAM budget for {device}; nothing is kept idle (retried every {} ms)",
+                    "{}: the OS reports no VRAM budget for {device:?}; nothing is kept idle (retried every {} ms)",
                     self.label,
                     self.every.as_millis()
                 );
@@ -442,7 +491,7 @@ impl VramWatch {
             }
             (Some(bytes), true) => {
                 log::info!(
-                    "{}: the OS reports a VRAM budget for {device} again ({bytes} bytes)",
+                    "{}: the OS reports a VRAM budget for {device:?} again ({bytes} bytes)",
                     self.label
                 );
                 state.failing = false;
@@ -456,9 +505,19 @@ impl VramWatch {
 
 #[cfg(test)]
 mod watch_tests {
-    use super::VramWatch;
+    use super::{AdapterKey, VramWatch};
     use std::cell::Cell;
     use std::time::Duration;
+
+    fn gpu(n: u32, bus: &str) -> AdapterKey {
+        AdapterKey::new(
+            wgpu::Backend::Vulkan,
+            0x10de,
+            0x2208,
+            bus,
+            format!("gpu{n}"),
+        )
+    }
 
     #[test]
     fn a_reading_is_cached_inside_the_interval_and_fresh_outside_it() {
@@ -469,48 +528,81 @@ mod watch_tests {
             calls.set(calls.get() + 1);
             Some(value)
         };
-        assert_eq!(kept.budget_with("gpu0", || query(10)), Some(10));
-        assert_eq!(kept.budget_with("gpu0", || query(20)), Some(10));
+        assert_eq!(
+            kept.budget_with(&gpu(0, "0000:01:00.0"), || query(10)),
+            Some(10)
+        );
+        assert_eq!(
+            kept.budget_with(&gpu(0, "0000:01:00.0"), || query(20)),
+            Some(10)
+        );
         assert_eq!(calls.get(), 1);
         let fresh = VramWatch::new("test", Duration::ZERO);
-        assert_eq!(fresh.budget_with("gpu0", || query(30)), Some(30));
-        assert_eq!(fresh.budget_with("gpu0", || query(40)), Some(40));
+        assert_eq!(
+            fresh.budget_with(&gpu(0, "0000:01:00.0"), || query(30)),
+            Some(30)
+        );
+        assert_eq!(
+            fresh.budget_with(&gpu(0, "0000:01:00.0"), || query(40)),
+            Some(40)
+        );
         assert_eq!(calls.get(), 3);
     }
 
     #[test]
     fn another_adapter_is_never_answered_from_the_cache_of_the_first() {
         let watch = VramWatch::new("test", Duration::MAX);
-        assert_eq!(watch.budget_with("gpu0", || Some(10)), Some(10));
-        assert_eq!(watch.budget_with("gpu1", || Some(99)), Some(99));
         assert_eq!(
-            watch.budget_with("gpu1", || Some(5)),
+            watch.budget_with(&gpu(0, "0000:01:00.0"), || Some(10)),
+            Some(10)
+        );
+        assert_eq!(
+            watch.budget_with(&gpu(1, "0000:02:00.0"), || Some(99)),
+            Some(99)
+        );
+        assert_eq!(
+            watch.budget_with(&gpu(1, "0000:02:00.0"), || Some(5)),
             Some(99),
             "cached for gpu1"
         );
         assert_eq!(
-            watch.budget_with("gpu0", || Some(11)),
+            watch.budget_with(&gpu(0, "0000:01:00.0"), || Some(11)),
             Some(11),
             "back to gpu0: asked again"
         );
     }
 
     #[test]
+    fn two_identical_cards_are_told_apart_by_their_bus() {
+        let watch = VramWatch::new("test", Duration::MAX);
+        let (a, b) = (
+            AdapterKey::new(wgpu::Backend::Vulkan, 0x10de, 0x2208, "0000:01:00.0", "RTX"),
+            AdapterKey::new(wgpu::Backend::Vulkan, 0x10de, 0x2208, "0000:02:00.0", "RTX"),
+        );
+        assert_ne!(a, b);
+        assert_eq!(watch.budget_with(&a, || Some(10)), Some(10));
+        assert_eq!(watch.budget_with(&b, || Some(20)), Some(20));
+    }
+
+    #[test]
     fn a_failed_query_is_retried_and_recovers_not_remembered_as_zero() {
         let watch = VramWatch::new("test", Duration::ZERO);
-        assert_eq!(watch.budget_with("gpu0", || None), None);
+        assert_eq!(watch.budget_with(&gpu(0, "0000:01:00.0"), || None), None);
         assert!(
             watch.state.lock().expect("lock").failing,
             "the failure was logged once"
         );
-        assert_eq!(watch.budget_with("gpu0", || None), None);
-        assert_eq!(watch.budget_with("gpu0", || Some(7)), Some(7));
+        assert_eq!(watch.budget_with(&gpu(0, "0000:01:00.0"), || None), None);
+        assert_eq!(
+            watch.budget_with(&gpu(0, "0000:01:00.0"), || Some(7)),
+            Some(7)
+        );
         assert!(
             !watch.state.lock().expect("lock").failing,
             "the recovery reset the flag"
         );
         // A later failure is announced again.
-        assert_eq!(watch.budget_with("gpu0", || None), None);
+        assert_eq!(watch.budget_with(&gpu(0, "0000:01:00.0"), || None), None);
         assert!(watch.state.lock().expect("lock").failing);
     }
 }

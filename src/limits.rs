@@ -151,10 +151,23 @@ impl GpuLimits {
         height: u32,
         bytes_per_pixel: u64,
     ) -> Option<TilingReason> {
+        self.tiling_reason_rows(width, height, (width as u64) * bytes_per_pixel)
+    }
+
+    /// [`Self::tiling_reason`] for a buffer whose rows are `row_bytes` apart: the binding is `row_bytes * height`, so
+    /// a padded row (a frame whose rows round up to a word) is asked about as it is bound, not as a rounded-up
+    /// per-pixel size. The one fit question; `tiling_reason` is `row_bytes = width * bytes_per_pixel`.
+    #[must_use]
+    pub const fn tiling_reason_rows(
+        &self,
+        width: u32,
+        height: u32,
+        row_bytes: u64,
+    ) -> Option<TilingReason> {
         if width > self.max_tile_dim || height > self.max_tile_dim {
             return Some(TilingReason::TextureDimension);
         }
-        if Self::image_bytes(width, height, bytes_per_pixel) > self.max_buffer_bytes {
+        if row_bytes.saturating_mul(height as u64) > self.max_buffer_bytes {
             return Some(TilingReason::BufferBinding);
         }
         None
@@ -198,6 +211,26 @@ mod tests {
         assert_eq!(
             limits.tiling_reason(20000, 100, RGBA_F32),
             Some(TilingReason::TextureDimension)
+        );
+    }
+
+    /// Padded rows are asked about as bound: 4093 Byte RGB pixels are a 12280-byte row (not 3 bytes x 4093, not a
+    /// rounded-up 4 bytes per pixel), and the binding is rows x height.
+    ///
+    /// Reddening mutation: compute the rows' bytes as `width * ceil(row / width)`.
+    #[test]
+    fn rows_are_asked_about_as_bound() {
+        let limits = GpuLimits::new(16384, 12280 * 2, 24 << 30, 19 << 30, true);
+        assert_eq!(limits.tiling_reason_rows(4093, 2, 12280), None);
+        assert_eq!(
+            limits.tiling_reason_rows(4093, 3, 12280),
+            Some(TilingReason::BufferBinding)
+        );
+        // Four bytes per pixel would have refused the two rows (16372 x 2 > 24560 is false, but 3 rows is the edge).
+        assert_eq!(limits.tiling_reason(4093, 2, 3), None);
+        assert_eq!(
+            limits.tiling_reason(4093, 2, 4),
+            Some(TilingReason::BufferBinding)
         );
     }
 

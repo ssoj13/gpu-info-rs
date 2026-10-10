@@ -2,6 +2,12 @@
 
 ## 2026-10-10
 
+- `GpuLimits::tiling_reason_rows(width, height, row_bytes)`: the fit of a buffer whose rows are PADDED (a Byte RGB
+  row of 4093 px is 12280 bytes, not a whole number of 4-byte pixels); `tiling_reason` is the same question for a
+  whole-pixel row. The caller owns what `row_bytes` is (ofx-host-wgpu `FrameFormat::row_bytes`).
+- `AdapterKey` (`vram.rs`): the identity `VramWatch` keys its cache by, computed once from `wgpu::AdapterInfo`
+  (backend, vendor, device, PCI bus id, name), so two identical cards on different buses are told apart.
+  `VramWatch::budget_with` takes it instead of a text key.
 - `VramWatch` is bound to its device: the cache is keyed by the adapter (vendor, device id, name) and an adapter
   asked about after another is read again, never answered from the first one's cache. A recovery after a failed
   reading is logged once and re-arms the failure log. Doc: the query must not call the watch (deadlock). Tests use
