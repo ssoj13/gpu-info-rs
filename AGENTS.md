@@ -13,8 +13,8 @@ comparing independently changing live readings.
 
 `VramWatch::new(label, every)` (const) + `budget(GpuVramContext)` = the OS VRAM budget cached for `every`, failures
 cached and logged once, retried after the interval. Feed it to `ResourcePool::set_budget` when a resource is
-returned. One watch per device, keyed by `AdapterKey::of(adapter)` (backend, vendor, device, PCI bus, name; compute it once, not per call; it re-keys on another adapter, cached readings are never shared), recovery after a failure is logged once, the query must never call the watch. `budget_with(&AdapterKey, query)` is the test seam (`Duration::ZERO` / `MAX` for the clock). ofx-finish's `retained.rs` keeps an equivalent private copy
-(`vram_quota`) that should move onto this.
+returned. One watch per device, keyed by `AdapterKey::of(adapter)` (the adapter handle: identical cards differ, a cache hit allocates nothing; it re-keys on another adapter, cached readings are never shared), recovery after a failure is logged once, the query must never call the watch. `budget_with(&AdapterKey, query)` is the test seam (`Duration::ZERO` / `MAX` for the clock). Linux/Android/FreeBSD read the LIVE `VK_EXT_memory_budget` budget of the largest device-local heap (not the static heap
+sum); no extension = unreported (`None`). ofx-runtime and ofx-finish use this watch.
 
 `GpuLimits::tiling_reason_rows(w, h, row_bytes)`: the buffer-binding fit for padded rows (`tiling_reason` = whole-pixel rows).
 

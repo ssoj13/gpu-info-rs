@@ -143,7 +143,12 @@ mod imp {
 
     impl VramQuerier {
         pub fn new(ctx: GpuVramContext<'_>) -> Option<Self> {
-            let hal_adapter = unsafe { ctx.adapter.as_hal::<wgpu::hal::api::Vulkan>() }?;
+            Self::of(ctx.adapter)
+        }
+
+        /// The querier of `adapter` (Vulkan only).
+        pub fn of(adapter: &wgpu::Adapter) -> Option<Self> {
+            let hal_adapter = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }?;
             let raw_phys = hal_adapter.raw_physical_device();
             let shared = hal_adapter.shared_instance();
             let instance = shared.raw_instance().clone();
@@ -178,7 +183,7 @@ mod imp {
                 }
                 let used = budget.heap_usage[best_heap];
                 let bud = budget.heap_budget[best_heap];
-                if used == 0 && bud == 0 {
+                if bud == 0 {
                     return None;
                 }
                 Some(VramInfo { used, budget: bud })
@@ -186,18 +191,11 @@ mod imp {
         }
     }
 
+    /// The LIVE budget (`VK_EXT_memory_budget`) of the largest device-local heap, the same semantics as Windows'
+    /// DXGI budget: what other processes use is already subtracted. `None` when the driver reports no budget (the
+    /// extension absent): the caller treats it as unreported, never as the static heap size.
     pub(super) fn vram_budget_adapter(adapter: &wgpu::Adapter) -> Option<u64> {
-        let hal_adapter = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }?;
-        let phys = hal_adapter.raw_physical_device();
-        let raw_instance = hal_adapter.shared_instance().raw_instance();
-        let props = unsafe { raw_instance.get_physical_device_memory_properties(phys) };
-        let count = props.memory_heap_count as usize;
-        let total: u64 = props.memory_heaps[..count]
-            .iter()
-            .filter(|h| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
-            .map(|h| h.size)
-            .sum();
-        if total == 0 { None } else { Some(total) }
+        VramQuerier::of(adapter)?.query().map(|info| info.budget)
     }
 
     pub(super) fn vram_budget_from_context(ctx: GpuVramContext<'_>) -> Option<u64> {
@@ -350,46 +348,43 @@ pub fn vram_budget_bytes(adapter: &wgpu::Adapter) -> Option<u64> {
     }
 }
 
-/// The identity of a GPU as far as wgpu tells it: backend, vendor id, device id, PCI bus id and name. Two identical
-/// cards differ in the bus id (empty where the backend reports none), so a [`VramWatch`] never answers one card's
-/// reading for the other. Compute it once per adapter ([`Self::of`]) and reuse it: it owns two strings.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AdapterKey {
-    backend: wgpu::Backend,
-    vendor: u32,
-    device: u32,
-    pci_bus: String,
-    name: String,
+/// The identity of a GPU for a [`VramWatch`]: the wgpu adapter handle itself. Two identical cards are two adapters,
+/// whatever vendor, device id, name or bus they report, and the comparison and the clone (a reference count) allocate
+/// nothing, so a cache hit costs no allocation. Build it with [`Self::of`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct AdapterKey(Repr);
+
+#[derive(Clone, PartialEq, Eq)]
+enum Repr {
+    Adapter(wgpu::Adapter),
+    /// A stand-in for tests, which have no GPU.
+    #[cfg(test)]
+    Test(u32),
 }
 
 impl AdapterKey {
-    /// A key from its parts (what [`Self::of`] reads from the adapter; tests build them directly).
-    pub fn new(
-        backend: wgpu::Backend,
-        vendor: u32,
-        device: u32,
-        pci_bus: impl Into<String>,
-        name: impl Into<String>,
-    ) -> Self {
-        Self {
-            backend,
-            vendor,
-            device,
-            pci_bus: pci_bus.into(),
-            name: name.into(),
-        }
-    }
-
     /// The key of `adapter`.
     pub fn of(adapter: &wgpu::Adapter) -> Self {
-        let info = adapter.get_info();
-        Self::new(
-            info.backend,
-            info.vendor,
-            info.device,
-            info.device_pci_bus_id,
-            info.name,
-        )
+        Self(Repr::Adapter(adapter.clone()))
+    }
+}
+
+/// Names the adapter in the watch's log lines (only logged on a failure or a recovery, so the info strings may be
+/// built here).
+impl std::fmt::Debug for AdapterKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Repr::Adapter(adapter) => {
+                let info = adapter.get_info();
+                write!(
+                    f,
+                    "{:?} {:04x}:{:04x} {} (bus {})",
+                    info.backend, info.vendor, info.device, info.name, info.device_pci_bus_id
+                )
+            }
+            #[cfg(test)]
+            Repr::Test(n) => write!(f, "test adapter {n}"),
+        }
     }
 }
 
@@ -401,15 +396,15 @@ impl AdapterKey {
 /// one (the platform reports none) is cached the same way - never remembered as a permanent zero - and logged once
 /// (`log::warn!`, prefixed with the watch's `label`); the first reading after a failure is logged once as a recovery.
 ///
-/// **One device:** the cache belongs to the adapter that was asked ([`AdapterKey`]: backend, vendor, device, PCI bus
-/// id, name). Asked about another adapter, the watch forgets its reading and queries at once, so a cached figure of
-/// one GPU is never answered for another; a consumer that watches one adapter computes its key once and calls
-/// [`Self::budget_with`]. Alternating two adapters through one watch re-reads every time: give each its own.
+/// **One device:** the cache belongs to the adapter that was asked ([`AdapterKey`]: the adapter handle, so two
+/// identical cards are told apart). Asked about another adapter, the watch forgets its reading and queries at once, so
+/// a cached figure of one GPU is never answered for another. Alternating two adapters through one watch re-reads every
+/// time: give each its own. A cache hit allocates nothing.
 ///
 /// **Reentrancy:** the query runs while the watch's lock is held. It must not call the watch ([`Self::budget`] or
 /// [`Self::budget_with`]) - that deadlocks.
 ///
-/// **Where used:** `ofx-runtime`'s GPU renderer pools; `ofx-finish`'s retained jobs keep an equivalent copy.
+/// **Where used:** `ofx-runtime`'s GPU renderer (its shared idle allowance) and `ofx-finish`'s retained jobs.
 pub struct VramWatch {
     label: &'static str,
     every: std::time::Duration,
@@ -505,18 +500,12 @@ impl VramWatch {
 
 #[cfg(test)]
 mod watch_tests {
-    use super::{AdapterKey, VramWatch};
+    use super::{AdapterKey, Repr, VramWatch};
     use std::cell::Cell;
     use std::time::Duration;
 
-    fn gpu(n: u32, bus: &str) -> AdapterKey {
-        AdapterKey::new(
-            wgpu::Backend::Vulkan,
-            0x10de,
-            0x2208,
-            bus,
-            format!("gpu{n}"),
-        )
+    fn gpu(n: u32) -> AdapterKey {
+        AdapterKey(Repr::Test(n))
     }
 
     #[test]
@@ -528,81 +517,48 @@ mod watch_tests {
             calls.set(calls.get() + 1);
             Some(value)
         };
-        assert_eq!(
-            kept.budget_with(&gpu(0, "0000:01:00.0"), || query(10)),
-            Some(10)
-        );
-        assert_eq!(
-            kept.budget_with(&gpu(0, "0000:01:00.0"), || query(20)),
-            Some(10)
-        );
+        assert_eq!(kept.budget_with(&gpu(0), || query(10)), Some(10));
+        assert_eq!(kept.budget_with(&gpu(0), || query(20)), Some(10));
         assert_eq!(calls.get(), 1);
         let fresh = VramWatch::new("test", Duration::ZERO);
-        assert_eq!(
-            fresh.budget_with(&gpu(0, "0000:01:00.0"), || query(30)),
-            Some(30)
-        );
-        assert_eq!(
-            fresh.budget_with(&gpu(0, "0000:01:00.0"), || query(40)),
-            Some(40)
-        );
+        assert_eq!(fresh.budget_with(&gpu(0), || query(30)), Some(30));
+        assert_eq!(fresh.budget_with(&gpu(0), || query(40)), Some(40));
         assert_eq!(calls.get(), 3);
     }
 
     #[test]
     fn another_adapter_is_never_answered_from_the_cache_of_the_first() {
         let watch = VramWatch::new("test", Duration::MAX);
+        assert_eq!(watch.budget_with(&gpu(0), || Some(10)), Some(10));
+        assert_eq!(watch.budget_with(&gpu(1), || Some(99)), Some(99));
         assert_eq!(
-            watch.budget_with(&gpu(0, "0000:01:00.0"), || Some(10)),
-            Some(10)
-        );
-        assert_eq!(
-            watch.budget_with(&gpu(1, "0000:02:00.0"), || Some(99)),
-            Some(99)
-        );
-        assert_eq!(
-            watch.budget_with(&gpu(1, "0000:02:00.0"), || Some(5)),
+            watch.budget_with(&gpu(1), || Some(5)),
             Some(99),
             "cached for gpu1"
         );
         assert_eq!(
-            watch.budget_with(&gpu(0, "0000:01:00.0"), || Some(11)),
+            watch.budget_with(&gpu(0), || Some(11)),
             Some(11),
             "back to gpu0: asked again"
         );
     }
 
     #[test]
-    fn two_identical_cards_are_told_apart_by_their_bus() {
-        let watch = VramWatch::new("test", Duration::MAX);
-        let (a, b) = (
-            AdapterKey::new(wgpu::Backend::Vulkan, 0x10de, 0x2208, "0000:01:00.0", "RTX"),
-            AdapterKey::new(wgpu::Backend::Vulkan, 0x10de, 0x2208, "0000:02:00.0", "RTX"),
-        );
-        assert_ne!(a, b);
-        assert_eq!(watch.budget_with(&a, || Some(10)), Some(10));
-        assert_eq!(watch.budget_with(&b, || Some(20)), Some(20));
-    }
-
-    #[test]
     fn a_failed_query_is_retried_and_recovers_not_remembered_as_zero() {
         let watch = VramWatch::new("test", Duration::ZERO);
-        assert_eq!(watch.budget_with(&gpu(0, "0000:01:00.0"), || None), None);
+        assert_eq!(watch.budget_with(&gpu(0), || None), None);
         assert!(
             watch.state.lock().expect("lock").failing,
             "the failure was logged once"
         );
-        assert_eq!(watch.budget_with(&gpu(0, "0000:01:00.0"), || None), None);
-        assert_eq!(
-            watch.budget_with(&gpu(0, "0000:01:00.0"), || Some(7)),
-            Some(7)
-        );
+        assert_eq!(watch.budget_with(&gpu(0), || None), None);
+        assert_eq!(watch.budget_with(&gpu(0), || Some(7)), Some(7));
         assert!(
             !watch.state.lock().expect("lock").failing,
             "the recovery reset the flag"
         );
         // A later failure is announced again.
-        assert_eq!(watch.budget_with(&gpu(0, "0000:01:00.0"), || None), None);
+        assert_eq!(watch.budget_with(&gpu(0), || None), None);
         assert!(watch.state.lock().expect("lock").failing);
     }
 }
