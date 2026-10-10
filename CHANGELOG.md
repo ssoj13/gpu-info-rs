@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-10-09
+
+- `ResourcePool` byte budget is adjustable at run time: `set_budget(bytes)` (a lower budget evicts the least
+  recently returned idle resources at once, removed under the pool lock and dropped after it; 0 keeps nothing;
+  raising resurrects nothing) and `budget()`. `put` reads the budget under the lock, so a concurrent lowering is
+  never undone. Consumers whose quota follows a live figure (ofx-finish: the OS VRAM budget) use the one pool
+  instead of their own idle lists. Tests: lowering evicts the oldest, 0 disables, raising resurrects nothing.
+- Strict rustdoc (`RUSTDOCFLAGS=-D warnings`, default and all features) is clean: module-doc links resolve at
+  the crate root, so links to non-reexported, private or feature-gated items became paths or code spans, and
+  the `pipeline_cache` / `wait` function-or-module links are disambiguated.
+
 ## 2026-10-08
 
 - Validated ResourcePool eviction outside its metadata lock and bounded rechecks.

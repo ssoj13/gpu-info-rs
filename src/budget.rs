@@ -27,13 +27,13 @@
 //!
 //! [`ram_budget_from`] is the pure core (unit-testable without the OS); [`ram_budget`] reads the OS. When
 //! the OS cannot answer, the result is [`BudgetError::UnknownRam`], never an invented default: the
-//! caller decides (an explicit `--mem`, a UI field), and [`ram_budget_or`] lets that override win
+//! caller decides (an explicit `--mem`, a UI field), and [`ram_budget_or`](crate::budget::ram_budget_or) lets that override win
 //! without querying the OS at all.
 //!
 //! # VRAM
-//! [`vram_share`] of the headroom (0.66; a unified-memory GPU, whose "VRAM" is system RAM the CPU
+//! [`vram_share`](crate::budget::vram_share) of the headroom (0.66; a unified-memory GPU, whose "VRAM" is system RAM the CPU
 //! needs too, 0.25). [`vram_budget`] reads [`crate::os::query`] (no GPU context); with a live
-//! context, [`live_headroom`] reads the driver through [`crate::VramQuerier`]. [`plan_vram`] splits
+//! context, `live_headroom` (feature `wgpu`) reads the driver through [`crate::VramQuerier`]. [`plan_vram`] splits
 //! that headroom between fixed targets, a decode pool and a resident-tile atlas.
 
 #![forbid(unsafe_code)]

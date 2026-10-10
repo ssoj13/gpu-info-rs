@@ -1,7 +1,7 @@
 //! The displays' ICC profiles, from the OS (OCIO `SystemMonitors`: `SystemMonitor_windows.cpp`,
 //! `SystemMonitor_macos.cpp`).
 //!
-//! wgpu-free. The OS calls are FFI, isolated here as [`crate::win_mem`] isolates its syscall;
+//! wgpu-free. The OS calls are FFI, isolated here as `win_mem` isolates its syscall;
 //! consumers (vfx-ocio's `SystemMonitors`) stay free of `unsafe`.
 
 use std::path::PathBuf;

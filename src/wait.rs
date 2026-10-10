@@ -1,4 +1,4 @@
-//! The ONE way the cluster submits GPU work it waits for and waits for it: [`submit`] then [`wait`]
+//! The ONE way the cluster submits GPU work it waits for and waits for it: [`submit`] then [`wait`](fn@crate::wait::wait)
 //! (or [`wait_idle`]), and [`map_read`] for a readback. No wait ever blocks inside wgpu.
 //!
 //! **Why never a blocking `Device::poll`:** wgpu-core 30 `Device::maintain` holds the device's

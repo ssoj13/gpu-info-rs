@@ -43,7 +43,7 @@ mod model;
 /// unmapped code).
 #[cfg(feature = "wgpu")]
 mod pin;
-/// The persistent pipeline cache of a device ([`pipeline_cache`]): compiled pipelines outlive the process.
+/// The persistent pipeline cache of a device ([`pipeline_cache`](fn@pipeline_cache)): compiled pipelines outlive the process.
 #[cfg(feature = "wgpu")]
 pub mod pipeline_cache;
 #[cfg(feature = "wgpu")]
@@ -78,7 +78,7 @@ pub mod shared_vk;
 pub mod shared_vk;
 #[cfg(feature = "wgpu")]
 mod vram;
-/// The one submit-and-wait of the cluster: [`submit`] + [`wait`] / [`wait_idle`] and [`map_read`],
+/// The one submit-and-wait of the cluster: [`submit`] + [`wait`](fn@wait) / [`wait_idle`] and [`map_read`],
 /// with no blocking `Device::poll` (it held the UI's `present` behind the GPU, and its timed form
 /// panics wgpu-core 30); and the future driver ([`block_on`]) plug-ins may run on host threads.
 #[cfg(feature = "wgpu")]
@@ -99,9 +99,9 @@ pub mod displays;
 
 /// OS-level VRAM + system RAM query without a GPU context, no wgpu: `nvidia-smi` / `reg query` /
 /// sysfs / `system_profiler`. `os` itself stays `#![forbid(unsafe_code)]`; the ONE exception is
-/// Windows RAM, which uses the `GlobalMemoryStatusEx` SYSCALL (isolated in [`win_mem`]) instead of a
+/// Windows RAM, which uses the `GlobalMemoryStatusEx` SYSCALL (isolated in `win_mem`) instead of a
 /// `wmic` process spawn — that spawn hitched a consumer's UI thread on every poll.
-/// Complements the wgpu capability report and the DXGI [`vram`] adapter budget.
+/// Complements the wgpu capability report and the DXGI `vram` adapter budget (`VramQuerier`, feature `wgpu`).
 pub mod os;
 
 /// THE RAM / VRAM budget formulas over [`os`] (one [`budget::Policy`] for RAM, the VRAM share and
@@ -392,7 +392,7 @@ pub fn shared_instance_descriptor() -> wgpu::InstanceDescriptor {
 /// Returns `None` (cached) when the module cannot be pinned, when no adapter is available or when
 /// device creation fails — never panics. A pin failure is logged as an error with its reason:
 /// no device is created in a module that could be unmapped under it.
-/// [`OnceLock::get_or_init`] collapses concurrent first callers into ONE negotiation.
+/// [`OnceLock::get_or_init`](std::sync::OnceLock::get_or_init) collapses concurrent first callers into ONE negotiation.
 ///
 /// **The instance honours wgpu's instance-level environment variables**
 /// ([`shared_instance_descriptor`]), read once, at the first call: `WGPU_BACKEND` (for example

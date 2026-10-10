@@ -9,6 +9,13 @@ reuse/dirty-clear/completion gate passed. Strict all-target/all-feature Clippy
 passed. The OS RAM smoke checks its formula on one snapshot rather than
 comparing independently changing live readings.
 
+## Run-time pool budgets (2026-10-09)
+
+`ResourcePool::set_budget(bytes)` / `budget()`: the byte budget is an atomic read under the pool lock. Lowering
+evicts the least recently returned idle resources at once (dropped outside the lock); 0 keeps nothing; raising
+brings nothing back. A consumer whose idle quota follows a live figure (OS VRAM budget, user setting) calls
+`set_budget` instead of keeping its own list. The const constructors are unchanged.
+
 ## Shared compute buffer workspace (2026-10-07)
 
 `COMPUTE_BUFFERS` is exclusively for the exact canonical `compute_device()`:

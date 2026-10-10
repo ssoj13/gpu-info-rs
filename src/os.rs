@@ -2,7 +2,7 @@
 //!
 //! **Zero `unsafe` in this module** — the platform shells are safe OS interfaces
 //! (`nvidia-smi`, sysfs, `system_profiler`), and the two calls that are not shells
-//! ([`crate::win_mem`], [`crate::stats`]) confine their `unsafe` to their own files.
+//! (`win_mem`, [`crate::stats`]) confine their `unsafe` to their own files.
 //!
 //! # Platform methods
 //!
@@ -234,7 +234,7 @@ fn platform_query() -> Option<GpuMemInfo> {
 /// when DXGI is missing is a path nobody exercises and nobody notices rotting, and on a
 /// machine with no DXGI there is no GPU worth reporting either.
 ///
-/// Same move [`crate::win_mem`] made when it replaced `wmic` with `GlobalMemoryStatusEx`.
+/// Same move `win_mem` made when it replaced `wmic` with `GlobalMemoryStatusEx`.
 #[cfg(target_os = "windows")]
 fn windows_query() -> Option<GpuMemInfo> {
     let (name, total, shared, used, unified) = crate::stats::windows_adapter_memory()?;

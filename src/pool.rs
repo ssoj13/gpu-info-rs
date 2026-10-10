@@ -25,6 +25,7 @@
 //! (upload staging slots, readback staging, plate upload targets on the shared device).
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A resource a [`ResourcePool`] keeps, found again by its key and counted by its bytes.
 pub trait Pooled {
@@ -288,9 +289,13 @@ impl<'gpu> BufferWorkspace<'gpu> {
 }
 
 /// Idle resources of one device, least recently returned first, at most `budget` bytes of them.
+///
+/// The byte budget can change at run time ([`ResourcePool::set_budget`]): a consumer whose quota follows a live
+/// figure (the OS VRAM budget, a user setting) keeps using this one pool instead of its own idle list.
 pub struct ResourcePool<R> {
     idle: Mutex<Idle<R>>,
-    budget: u64,
+    /// Read under the `idle` lock wherever it decides what is kept, so a concurrent lowering is never undone.
+    budget: AtomicU64,
     max_entries: usize,
 }
 
@@ -302,7 +307,7 @@ struct Idle<R> {
 impl<R> std::fmt::Debug for ResourcePool<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResourcePool")
-            .field("budget", &self.budget)
+            .field("budget", &self.budget.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
@@ -316,7 +321,7 @@ impl<R: Pooled> ResourcePool<R> {
                 slots: Vec::new(),
                 bytes: 0,
             }),
-            budget,
+            budget: AtomicU64::new(budget),
             max_entries: usize::MAX,
         }
     }
@@ -329,9 +334,33 @@ impl<R: Pooled> ResourcePool<R> {
                 slots: Vec::new(),
                 bytes: 0,
             }),
-            budget,
+            budget: AtomicU64::new(budget),
             max_entries,
         }
+    }
+
+    /// The current byte budget of idle resources.
+    pub fn budget(&self) -> u64 {
+        self.budget.load(Ordering::Relaxed)
+    }
+
+    /// Change the byte budget. A lower one evicts the least recently returned idle resources beyond it at once
+    /// (removed under the pool lock, dropped after it is released, as in [`Self::put`]); 0 keeps nothing. A
+    /// higher one only lets later returns stay: nothing evicted comes back.
+    pub fn set_budget(&self, bytes: u64) {
+        let evicted = {
+            let mut idle = self.idle();
+            self.budget.store(bytes, Ordering::Relaxed);
+            let mut over = 0;
+            let mut kept = idle.bytes;
+            while kept > bytes && over < idle.slots.len() {
+                kept -= idle.slots[over].bytes();
+                over += 1;
+            }
+            idle.bytes = kept;
+            idle.slots.drain(..over).collect::<Vec<_>>()
+        };
+        drop(evicted);
     }
 
     fn idle(&self) -> std::sync::MutexGuard<'_, Idle<R>> {
@@ -353,19 +382,24 @@ impl<R: Pooled> ResourcePool<R> {
     /// returned ones beyond the budget; one larger than the whole budget is dropped.
     pub fn put(&self, resource: R) {
         let size = resource.bytes();
-        if size > self.budget || self.max_entries == 0 {
+        if size > self.budget() || self.max_entries == 0 {
             return;
         }
         let mut idle = self.idle();
         if idle.slots.try_reserve(1).is_err() {
             return;
         }
+        // The budget is read again under each acquisition of the lock: a concurrent `set_budget` holds it while
+        // it evicts, so a lowering is never followed by a return above it.
         // Driver-backed destruction may wait for other queues. Never run it
         // under the metadata lock, and bound retries to the initial idle count
         // so concurrent returns cannot keep this caller evicting indefinitely.
         let attempts = idle.slots.len();
         for _ in 0..attempts {
-            if idle.bytes <= self.budget - size && idle.slots.len() < self.max_entries {
+            let budget = self.budget();
+            // A resource over a (just lowered) budget evicts nothing: it is refused below.
+            if size > budget || (idle.bytes <= budget - size && idle.slots.len() < self.max_entries)
+            {
                 break;
             }
             let old = idle.slots.remove(0);
@@ -374,10 +408,13 @@ impl<R: Pooled> ResourcePool<R> {
             drop(old);
             idle = self.idle();
         }
-        if idle.bytes > self.budget - size || idle.slots.len() >= self.max_entries {
+        let budget = self.budget();
+        if size > budget || idle.bytes > budget - size || idle.slots.len() >= self.max_entries {
             return;
         }
-        if idle.slots.try_reserve(1).is_err() { return; }
+        if idle.slots.try_reserve(1).is_err() {
+            return;
+        }
         idle.bytes += size;
         idle.slots.push(resource);
     }
@@ -576,7 +613,10 @@ mod tests {
 
     #[test]
     fn eviction_destroys_resources_outside_metadata_lock() {
-        use std::sync::{Arc, Weak, atomic::{AtomicBool, Ordering}};
+        use std::sync::{
+            Arc, Weak,
+            atomic::{AtomicBool, Ordering},
+        };
         struct Probe {
             pool: Weak<ResourcePool<Probe>>,
             unlocked: Arc<AtomicBool>,
@@ -584,18 +624,24 @@ mod tests {
         impl Pooled for Probe {
             type Key = ();
             fn key(&self) {}
-            fn bytes(&self) -> u64 { 1 }
+            fn bytes(&self) -> u64 {
+                1
+            }
         }
         impl Drop for Probe {
             fn drop(&mut self) {
                 if let Some(pool) = self.pool.upgrade() {
-                    self.unlocked.store(pool.idle.try_lock().is_ok(), Ordering::Relaxed);
+                    self.unlocked
+                        .store(pool.idle.try_lock().is_ok(), Ordering::Relaxed);
                 }
             }
         }
         let pool = Arc::new(ResourcePool::with_limits(1, 1));
         let unlocked = Arc::new(AtomicBool::new(false));
-        let resource = || Probe { pool: Arc::downgrade(&pool), unlocked: unlocked.clone() };
+        let resource = || Probe {
+            pool: Arc::downgrade(&pool),
+            unlocked: unlocked.clone(),
+        };
         pool.put(resource());
         pool.put(resource());
         assert!(unlocked.load(Ordering::Relaxed));
@@ -811,5 +857,49 @@ mod tests {
         assert_eq!(pool.take(1).map(|f| f.id), Some(3));
         pool.put(fake(3, 31, 5));
         assert_eq!(pool.idle_count(), (1, 15));
+    }
+
+    /// Lowering the budget evicts the least recently returned at once, down to the new budget.
+    #[test]
+    fn lowering_the_budget_evicts_the_oldest_first() {
+        let pool = ResourcePool::with_limits(100, 8);
+        for id in 1..=4 {
+            pool.put(fake(id, 20, id));
+        }
+        assert_eq!(pool.idle_count(), (4, 80));
+        pool.set_budget(45);
+        assert_eq!(pool.budget(), 45);
+        // 80 -> 60 -> 40: ids 1 and 2 go, 3 and 4 stay.
+        assert_eq!(pool.idle_count(), (2, 40));
+        assert!(pool.take(1).is_none() && pool.take(2).is_none());
+        assert_eq!(pool.take(3).map(|f| f.id), Some(3));
+        assert_eq!(pool.take(4).map(|f| f.id), Some(4));
+    }
+
+    /// A budget of 0 evicts everything and keeps no later return.
+    #[test]
+    fn a_zero_budget_keeps_nothing() {
+        let pool = ResourcePool::new(100);
+        pool.put(fake(1, 10, 1));
+        pool.set_budget(0);
+        assert_eq!(pool.idle_count(), (0, 0));
+        pool.put(fake(1, 10, 2));
+        assert_eq!(pool.idle_count(), (0, 0));
+        assert!(pool.take(1).is_none());
+    }
+
+    /// Raising the budget brings nothing evicted back; only later returns use the room.
+    #[test]
+    fn raising_the_budget_resurrects_nothing() {
+        let pool = ResourcePool::new(20);
+        pool.put(fake(1, 20, 1));
+        pool.set_budget(10);
+        assert_eq!(pool.idle_count(), (0, 0));
+        pool.set_budget(100);
+        assert_eq!(pool.budget(), 100);
+        assert_eq!(pool.idle_count(), (0, 0));
+        assert!(pool.take(1).is_none());
+        pool.put(fake(1, 20, 2));
+        assert_eq!(pool.take(1).map(|f| f.id), Some(2));
     }
 }

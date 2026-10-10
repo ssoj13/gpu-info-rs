@@ -21,7 +21,7 @@
 //!
 //! # What is NOT here
 //!
-//! Only Vulkan can do this today. On a Metal or DX12 adapter [`open_shared`] returns `None` and
+//! Only Vulkan can do this today. On a Metal or DX12 adapter `open_shared` returns `None` and
 //! the caller falls back to the ordinary `request_device` - loudly, because a silent fallback here
 //! means every decoded frame is copied twice and nobody would ever see why.
 

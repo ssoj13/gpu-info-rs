@@ -6,7 +6,7 @@
 //! on disk serves every process on the same adapter and driver: the first pipeline of a shader compiles once, every
 //! later process loads it.
 //!
-//! **How:** [`pipeline_cache`] opens one cache per device (a process-wide registry), seeded from
+//! **How:** [`pipeline_cache`](fn@crate::pipeline_cache::pipeline_cache) opens one cache per device (a process-wide registry), seeded from
 //! `<cache dir>/gpu-info/wgpu-pipelines/<key>` with `key = wgpu::util::pipeline_cache_key` (adapter vendor, device
 //! and backend); a pipeline is created with `cache: Some(cache.cache())` and [`DiskPipelineCache::save`] writes the
 //! data back after a compile. `None` where there is nothing to cache: a device without

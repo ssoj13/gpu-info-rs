@@ -2,7 +2,7 @@
 //!
 //! # Why this exists next to [`crate::os`]
 //!
-//! [`os`](crate::os) answers "what GPU is this and how much VRAM does it have" by shelling
+//! [`os`](mod@crate::os) answers "what GPU is this and how much VRAM does it have" by shelling
 //! out: `system_profiler` (~1 s on macOS), `nvidia-smi`, `reg query`. That is acceptable for a
 //! one-shot capability probe at start-up and completely wrong for a monitor widget — a process
 //! spawn per sample hitches the caller's UI thread.
@@ -21,7 +21,7 @@
 //! | Windows (any vendor) | yes | yes | PDH `GPU Engine` counters + DXGI `QueryVideoMemoryInfo` — the pair Task Manager reads, so NVML and `nvidia-smi` are not needed |
 //! | Linux (NVIDIA) | no | no | needs NVML; `nvidia-smi` would be a spawn, so it is deliberately not used here |
 //!
-//! Callers that need the missing pieces should fall back to [`os::query`](crate::os::query)
+//! Callers that need the missing pieces should fall back to [`crate::os::query`]
 //! themselves, on their own slow path, and cache the result.
 
 #[cfg(target_os = "macos")]
