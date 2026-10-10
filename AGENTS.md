@@ -9,6 +9,13 @@ reuse/dirty-clear/completion gate passed. Strict all-target/all-feature Clippy
 passed. The OS RAM smoke checks its formula on one snapshot rather than
 comparing independently changing live readings.
 
+## VramWatch (2026-10-10)
+
+`VramWatch::new(label, every)` (const) + `budget(GpuVramContext)` = the OS VRAM budget cached for `every`, failures
+cached and logged once, retried after the interval. Feed it to `ResourcePool::set_budget` when a resource is
+returned. `budget_with(query)` is the test seam. ofx-finish's `retained.rs` keeps an equivalent private copy
+(`vram_quota`) that should move onto this.
+
 ## Run-time pool budgets (2026-10-09)
 
 `ResourcePool::set_budget(bytes)` / `budget()`: the byte budget is an atomic read under the pool lock. Lowering

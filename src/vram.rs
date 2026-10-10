@@ -349,3 +349,114 @@ pub fn vram_budget_bytes(adapter: &wgpu::Adapter) -> Option<u64> {
         None
     }
 }
+
+/// A rate-limited reading of the OS VRAM budget for a consumer whose idle quota follows it (a resource pool's
+/// `set_budget`).
+///
+/// **Why:** the budget changes while the process runs (other processes, the OS), so a pool's quota is queried again
+/// from time to time, but a driver query per retire is a syscall storm. The reading is cached for `every`; a failed
+/// one (the platform reports none) is cached the same way - never remembered as a permanent zero - and logged once
+/// (`log::warn!`, prefixed with the watch's `label`). Process-wide statics are the intended use (`const fn new`).
+///
+/// **Where used:** `ofx-runtime`'s GPU renderer pools; `ofx-finish`'s retained jobs keep an equivalent copy.
+pub struct VramWatch {
+    label: &'static str,
+    every: std::time::Duration,
+    state: std::sync::Mutex<WatchState>,
+}
+
+/// The last reading of a [`VramWatch`].
+struct WatchState {
+    budget: Option<u64>,
+    at: Option<std::time::Instant>,
+    failure_logged: bool,
+}
+
+impl std::fmt::Debug for VramWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VramWatch")
+            .field("label", &self.label)
+            .field("every", &self.every)
+            .finish_non_exhaustive()
+    }
+}
+
+impl VramWatch {
+    /// A watch that queries at most once per `every`; `label` names the consumer in the one failure log line.
+    pub const fn new(label: &'static str, every: std::time::Duration) -> Self {
+        Self {
+            label,
+            every,
+            state: std::sync::Mutex::new(WatchState {
+                budget: None,
+                at: None,
+                failure_logged: false,
+            }),
+        }
+    }
+
+    /// The OS VRAM budget of the context's device in bytes, read again when the last reading is older than the
+    /// interval; `None` while the platform reports none.
+    pub fn budget(&self, ctx: GpuVramContext<'_>) -> Option<u64> {
+        self.budget_with(|| vram_budget_from_context(ctx))
+    }
+
+    /// [`Self::budget`] with the query supplied (a test drives the rate limit and the failure path with it).
+    pub fn budget_with(&self, query: impl FnOnce() -> Option<u64>) -> Option<u64> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.at.is_some_and(|at| at.elapsed() < self.every) {
+            return state.budget;
+        }
+        state.budget = query();
+        if state.budget.is_none() && !state.failure_logged {
+            log::warn!(
+                "{}: the OS reports no VRAM budget for the device; nothing is kept idle (retried every {} ms)",
+                self.label,
+                self.every.as_millis()
+            );
+            state.failure_logged = true;
+        }
+        state.at = Some(std::time::Instant::now());
+        state.budget
+    }
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::VramWatch;
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    #[test]
+    fn queries_are_rate_limited_and_fresh_after_the_interval() {
+        let watch = VramWatch::new("test", Duration::from_millis(60));
+        let calls = Cell::new(0);
+        let query = |value: u64| {
+            calls.set(calls.get() + 1);
+            Some(value)
+        };
+        assert_eq!(watch.budget_with(|| query(10)), Some(10));
+        // Inside the interval the cached reading answers and the query does not run.
+        assert_eq!(watch.budget_with(|| query(20)), Some(10));
+        assert_eq!(calls.get(), 1);
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(watch.budget_with(|| query(30)), Some(30));
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn a_failed_query_is_cached_then_retried_not_remembered_as_zero() {
+        let watch = VramWatch::new("test", Duration::from_millis(60));
+        assert_eq!(watch.budget_with(|| None), None);
+        assert_eq!(
+            watch.budget_with(|| Some(7)),
+            None,
+            "cached inside the interval"
+        );
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(watch.budget_with(|| Some(7)), Some(7));
+    }
+}

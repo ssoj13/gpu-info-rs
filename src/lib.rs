@@ -129,7 +129,7 @@ pub use image::{GpuImage, GpuImageError};
 pub use model::{AdapterReport, DownlevelReport, GpuReport, TextureFormatReport};
 #[cfg(feature = "wgpu")]
 pub use vram::{
-    GpuVramContext, VramInfo, VramQuerier, vram_budget_bytes, vram_budget_from_context,
+    GpuVramContext, VramInfo, VramQuerier, VramWatch, vram_budget_bytes, vram_budget_from_context,
 };
 #[cfg(feature = "wgpu")]
 pub use wait::{

@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-10-10
+
+- `VramWatch` (`vram.rs`): a rate-limited reading of the OS VRAM budget (`vram_budget_from_context`) for a consumer
+  whose pool quota follows it (`ResourcePool::set_budget`). The reading is cached for the watch's interval; a failed
+  one is cached the same way (retried after the interval, never remembered as a permanent zero) and logged once.
+  `const fn new`, so a process-wide static works; `budget_with(query)` drives the rate limit in tests. First
+  consumer: ofx-runtime's GPU renderer.
+
 ## 2026-10-09
 
 - `ResourcePool` byte budget is adjustable at run time: `set_budget(bytes)` (a lower budget evicts the least
