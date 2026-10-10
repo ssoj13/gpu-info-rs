@@ -13,7 +13,7 @@ comparing independently changing live readings.
 
 `VramWatch::new(label, every)` (const) + `budget(GpuVramContext)` = the OS VRAM budget cached for `every`, failures
 cached and logged once, retried after the interval. Feed it to `ResourcePool::set_budget` when a resource is
-returned. `budget_with(query)` is the test seam. ofx-finish's `retained.rs` keeps an equivalent private copy
+returned. One watch per device (it re-keys on another adapter, cached readings are never shared), recovery after a failure is logged once, the query must never call the watch. `budget_with(device, query)` is the test seam (`Duration::ZERO` / `MAX` for the clock). ofx-finish's `retained.rs` keeps an equivalent private copy
 (`vram_quota`) that should move onto this.
 
 ## Run-time pool budgets (2026-10-09)

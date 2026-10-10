@@ -2,6 +2,10 @@
 
 ## 2026-10-10
 
+- `VramWatch` is bound to its device: the cache is keyed by the adapter (vendor, device id, name) and an adapter
+  asked about after another is read again, never answered from the first one's cache. A recovery after a failed
+  reading is logged once and re-arms the failure log. Doc: the query must not call the watch (deadlock). Tests use
+  `Duration::ZERO` / `Duration::MAX` instead of sleeping.
 - `VramWatch` (`vram.rs`): a rate-limited reading of the OS VRAM budget (`vram_budget_from_context`) for a consumer
   whose pool quota follows it (`ResourcePool::set_budget`). The reading is cached for the watch's interval; a failed
   one is cached the same way (retried after the interval, never remembered as a permanent zero) and logged once.

@@ -350,13 +350,20 @@ pub fn vram_budget_bytes(adapter: &wgpu::Adapter) -> Option<u64> {
     }
 }
 
-/// A rate-limited reading of the OS VRAM budget for a consumer whose idle quota follows it (a resource pool's
-/// `set_budget`).
+/// A rate-limited reading of the OS VRAM budget of ONE device for a consumer whose idle quota follows it (a resource
+/// pool's `set_budget`).
 ///
 /// **Why:** the budget changes while the process runs (other processes, the OS), so a pool's quota is queried again
 /// from time to time, but a driver query per retire is a syscall storm. The reading is cached for `every`; a failed
 /// one (the platform reports none) is cached the same way - never remembered as a permanent zero - and logged once
-/// (`log::warn!`, prefixed with the watch's `label`). Process-wide statics are the intended use (`const fn new`).
+/// (`log::warn!`, prefixed with the watch's `label`); the first reading after a failure is logged once as a recovery.
+///
+/// **One device:** the cache belongs to the adapter that was asked ([`Self::budget`] keys it by vendor, device id and
+/// name). Asked about another adapter, the watch forgets its reading and queries at once, so a cached figure of one
+/// GPU is never answered for another.
+///
+/// **Reentrancy:** the query runs while the watch's lock is held. It must not call the watch ([`Self::budget`] or
+/// [`Self::budget_with`]) - that deadlocks.
 ///
 /// **Where used:** `ofx-runtime`'s GPU renderer pools; `ofx-finish`'s retained jobs keep an equivalent copy.
 pub struct VramWatch {
@@ -367,9 +374,12 @@ pub struct VramWatch {
 
 /// The last reading of a [`VramWatch`].
 struct WatchState {
+    /// The device the reading is of.
+    device: Option<String>,
     budget: Option<u64>,
     at: Option<std::time::Instant>,
-    failure_logged: bool,
+    /// The last reading failed (and said so): a success logs the recovery.
+    failing: bool,
 }
 
 impl std::fmt::Debug for VramWatch {
@@ -382,42 +392,62 @@ impl std::fmt::Debug for VramWatch {
 }
 
 impl VramWatch {
-    /// A watch that queries at most once per `every`; `label` names the consumer in the one failure log line.
+    /// A watch that queries at most once per `every` (zero: every call; `Duration::MAX`: once per device); `label`
+    /// names the consumer in the failure and recovery log lines.
     pub const fn new(label: &'static str, every: std::time::Duration) -> Self {
         Self {
             label,
             every,
             state: std::sync::Mutex::new(WatchState {
+                device: None,
                 budget: None,
                 at: None,
-                failure_logged: false,
+                failing: false,
             }),
         }
     }
 
     /// The OS VRAM budget of the context's device in bytes, read again when the last reading is older than the
-    /// interval; `None` while the platform reports none.
+    /// interval or was of another adapter; `None` while the platform reports none.
     pub fn budget(&self, ctx: GpuVramContext<'_>) -> Option<u64> {
-        self.budget_with(|| vram_budget_from_context(ctx))
+        let info = ctx.adapter.get_info();
+        let device = format!("{:04x}:{:04x}:{}", info.vendor, info.device, info.name);
+        self.budget_with(&device, || vram_budget_from_context(ctx))
     }
 
-    /// [`Self::budget`] with the query supplied (a test drives the rate limit and the failure path with it).
-    pub fn budget_with(&self, query: impl FnOnce() -> Option<u64>) -> Option<u64> {
+    /// [`Self::budget`] for the device named `device` with the query supplied (a test drives the rate limit, the
+    /// re-keying and the failure path with it). `query` must not call this watch.
+    pub fn budget_with(&self, device: &str, query: impl FnOnce() -> Option<u64>) -> Option<u64> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.at.is_some_and(|at| at.elapsed() < self.every) {
+        let same = state.device.as_deref() == Some(device);
+        if same && state.at.is_some_and(|at| at.elapsed() < self.every) {
             return state.budget;
         }
+        if !same {
+            state.device = Some(device.to_owned());
+            state.failing = false;
+        }
         state.budget = query();
-        if state.budget.is_none() && !state.failure_logged {
-            log::warn!(
-                "{}: the OS reports no VRAM budget for the device; nothing is kept idle (retried every {} ms)",
-                self.label,
-                self.every.as_millis()
-            );
-            state.failure_logged = true;
+        match (state.budget, state.failing) {
+            (None, false) => {
+                log::warn!(
+                    "{}: the OS reports no VRAM budget for {device}; nothing is kept idle (retried every {} ms)",
+                    self.label,
+                    self.every.as_millis()
+                );
+                state.failing = true;
+            }
+            (Some(bytes), true) => {
+                log::info!(
+                    "{}: the OS reports a VRAM budget for {device} again ({bytes} bytes)",
+                    self.label
+                );
+                state.failing = false;
+            }
+            _ => {}
         }
         state.at = Some(std::time::Instant::now());
         state.budget
@@ -431,32 +461,56 @@ mod watch_tests {
     use std::time::Duration;
 
     #[test]
-    fn queries_are_rate_limited_and_fresh_after_the_interval() {
-        let watch = VramWatch::new("test", Duration::from_millis(60));
+    fn a_reading_is_cached_inside_the_interval_and_fresh_outside_it() {
+        // `MAX` never expires, `ZERO` always has: no sleeping, no dependence on call latency.
+        let kept = VramWatch::new("test", Duration::MAX);
         let calls = Cell::new(0);
         let query = |value: u64| {
             calls.set(calls.get() + 1);
             Some(value)
         };
-        assert_eq!(watch.budget_with(|| query(10)), Some(10));
-        // Inside the interval the cached reading answers and the query does not run.
-        assert_eq!(watch.budget_with(|| query(20)), Some(10));
+        assert_eq!(kept.budget_with("gpu0", || query(10)), Some(10));
+        assert_eq!(kept.budget_with("gpu0", || query(20)), Some(10));
         assert_eq!(calls.get(), 1);
-        std::thread::sleep(Duration::from_millis(80));
-        assert_eq!(watch.budget_with(|| query(30)), Some(30));
-        assert_eq!(calls.get(), 2);
+        let fresh = VramWatch::new("test", Duration::ZERO);
+        assert_eq!(fresh.budget_with("gpu0", || query(30)), Some(30));
+        assert_eq!(fresh.budget_with("gpu0", || query(40)), Some(40));
+        assert_eq!(calls.get(), 3);
     }
 
     #[test]
-    fn a_failed_query_is_cached_then_retried_not_remembered_as_zero() {
-        let watch = VramWatch::new("test", Duration::from_millis(60));
-        assert_eq!(watch.budget_with(|| None), None);
+    fn another_adapter_is_never_answered_from_the_cache_of_the_first() {
+        let watch = VramWatch::new("test", Duration::MAX);
+        assert_eq!(watch.budget_with("gpu0", || Some(10)), Some(10));
+        assert_eq!(watch.budget_with("gpu1", || Some(99)), Some(99));
         assert_eq!(
-            watch.budget_with(|| Some(7)),
-            None,
-            "cached inside the interval"
+            watch.budget_with("gpu1", || Some(5)),
+            Some(99),
+            "cached for gpu1"
         );
-        std::thread::sleep(Duration::from_millis(80));
-        assert_eq!(watch.budget_with(|| Some(7)), Some(7));
+        assert_eq!(
+            watch.budget_with("gpu0", || Some(11)),
+            Some(11),
+            "back to gpu0: asked again"
+        );
+    }
+
+    #[test]
+    fn a_failed_query_is_retried_and_recovers_not_remembered_as_zero() {
+        let watch = VramWatch::new("test", Duration::ZERO);
+        assert_eq!(watch.budget_with("gpu0", || None), None);
+        assert!(
+            watch.state.lock().expect("lock").failing,
+            "the failure was logged once"
+        );
+        assert_eq!(watch.budget_with("gpu0", || None), None);
+        assert_eq!(watch.budget_with("gpu0", || Some(7)), Some(7));
+        assert!(
+            !watch.state.lock().expect("lock").failing,
+            "the recovery reset the flag"
+        );
+        // A later failure is announced again.
+        assert_eq!(watch.budget_with("gpu0", || None), None);
+        assert!(watch.state.lock().expect("lock").failing);
     }
 }
