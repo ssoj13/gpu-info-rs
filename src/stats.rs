@@ -79,11 +79,33 @@ pub struct GpuStats {
     /// Total memory the GPU can address. Equals system RAM when [`unified`](Self::unified).
     pub mem_total_bytes: Option<u64>,
     /// System RAM the driver has committed for a *discrete* GPU (Windows WDDM
-    /// `GPU Adapter Memory \ Shared Usage`). Growth under load means VRAM overflowed and the
-    /// driver spilled to host memory ("sysmem fallback"): every access then crosses PCIe and
-    /// kernels run tens of times slower while utilisation still looks high. `None` on unified
-    /// parts, where [`mem_used_bytes`](Self::mem_used_bytes) already is this counter, and on
-    /// platforms that do not publish it.
+    /// `GPU Adapter Memory \ Shared Usage`). `None` on unified parts, where
+    /// [`mem_used_bytes`](Self::mem_used_bytes) already is this counter, and on platforms that
+    /// do not publish it (DRM sysfs, IOKit).
+    ///
+    /// # Why it exists
+    ///
+    /// Added 2026-10-12 for lgpt-rs. When a workload outgrows dedicated VRAM, the Windows
+    /// driver does not fail the allocation: it silently pages the overflow to host RAM
+    /// ("sysmem fallback"). Every access then crosses PCIe, kernels run tens of times slower,
+    /// and utilisation still reads high, so `mem_used_bytes` alone (pinned near the card's
+    /// size) cannot tell a full card from a spilling one. Measured there: pythia-160m training
+    /// went from 0.2 s to 20 s per step with 9.5 GB in this counter. Callers compare it with a
+    /// baseline taken before the work and stop or shrink the job when it grows.
+    ///
+    /// # Caveats (what can break)
+    ///
+    /// * It is the **adapter-wide** total over all processes, like Task Manager: a browser or
+    ///   compositor holds a few hundred MiB here at idle. Compare deltas against a baseline,
+    ///   never the absolute value against zero.
+    /// * It counts every shared allocation, not only paged-out VRAM: staging/upload buffers a
+    ///   program maps on purpose grow it too. A growth threshold must leave room for them.
+    /// * Adding this public field to a struct that is not `#[non_exhaustive]` breaks any
+    ///   downstream code that builds `GpuStats { .. }` with an exhaustive literal; use
+    ///   `..Default::default()`.
+    /// * PDH resolves the counter by its English name (`PdhAddEnglishCounterW`); if the counter
+    ///   set is missing (old Windows, disabled performance counters) the whole PDH query fails
+    ///   and every live field is `None`, this one included.
     pub mem_shared_bytes: Option<u64>,
     /// GPU shares system RAM (Apple Silicon, integrated GPUs).
     pub unified: bool,
