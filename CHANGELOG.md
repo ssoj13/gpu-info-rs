@@ -2,6 +2,11 @@
 
 ## 2026-10-12
 
+- `GpuStats::mem_shared_bytes` (additive): on Windows, the WDDM `GPU Adapter Memory \ Shared Usage` of a
+  *discrete* adapter, which `Counters::sample` already read but dropped. Growth under load is the sysmem-fallback
+  signal (VRAM overflow paged to host RAM; measured in lgpt-rs: pythia-160m training went from 0.2 s to 20 s per
+  step at 9.5 GB shared). `None` on unified parts (`mem_used_bytes` is that counter) and on DRM/IOKit.
+
 - `ComputeGpu::instance` (additive): the wgpu instance the compute adapter came from, so a consumer that adopts an
   existing device and needs all four handles of one setup (the OIDN denoiser's cubecl `WgpuSetup`) can use the compute
   device instead of the UI's shared one.

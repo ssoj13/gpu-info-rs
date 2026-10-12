@@ -78,6 +78,13 @@ pub struct GpuStats {
     pub mem_used_bytes: Option<u64>,
     /// Total memory the GPU can address. Equals system RAM when [`unified`](Self::unified).
     pub mem_total_bytes: Option<u64>,
+    /// System RAM the driver has committed for a *discrete* GPU (Windows WDDM
+    /// `GPU Adapter Memory \ Shared Usage`). Growth under load means VRAM overflowed and the
+    /// driver spilled to host memory ("sysmem fallback"): every access then crosses PCIe and
+    /// kernels run tens of times slower while utilisation still looks high. `None` on unified
+    /// parts, where [`mem_used_bytes`](Self::mem_used_bytes) already is this counter, and on
+    /// platforms that do not publish it.
+    pub mem_shared_bytes: Option<u64>,
     /// GPU shares system RAM (Apple Silicon, integrated GPUs).
     pub unified: bool,
     /// Core temperature in °C.

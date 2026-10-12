@@ -79,21 +79,21 @@ pub fn query() -> Option<GpuStats> {
         slot.clone()
     })?;
 
-    let (util_pct, mem_used_bytes) = COUNTERS.with(|slot| {
+    let sample = COUNTERS.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
             *slot = Counters::open();
         }
-        match slot.as_mut() {
-            Some(c) => c.sample(&adapter.luid_tag, adapter.unified),
-            None => (None, None),
-        }
+        slot.as_mut()
+            .map(|c| c.sample(&adapter.luid_tag, adapter.unified))
+            .unwrap_or_default()
     });
 
     let stats = GpuStats {
         name: Some(adapter.name),
-        util_pct,
-        mem_used_bytes,
+        util_pct: sample.util_pct,
+        mem_used_bytes: sample.used,
+        mem_shared_bytes: sample.spilled,
         mem_total_bytes: Some(adapter.total_bytes).filter(|b| *b > 0),
         unified: adapter.unified,
         // Windows publishes no thermal, clock, power or fan counter; `super::enrich` fills
@@ -123,7 +123,7 @@ pub(crate) fn adapter_memory() -> Option<(String, u64, u64, u64, bool)> {
             *slot = Counters::open();
         }
         slot.as_mut()
-            .and_then(|c| c.sample(&adapter.luid_tag, adapter.unified).1)
+            .and_then(|c| c.sample(&adapter.luid_tag, adapter.unified).used)
     });
     Some((
         adapter.name,
@@ -232,6 +232,17 @@ struct Counters {
     buffer: Vec<u8>,
 }
 
+/// One poll of [`Counters`] for one adapter.
+#[derive(Clone, Copy, Debug, Default)]
+struct Sample {
+    /// Busiest engine type, in percent.
+    util_pct: Option<f32>,
+    /// The adapter's own memory in use (dedicated, or shared on a unified part).
+    used: Option<u64>,
+    /// Shared system memory committed for a discrete adapter; `None` on a unified one.
+    spilled: Option<u64>,
+}
+
 impl Counters {
     fn open() -> Option<Self> {
         let mut query = PDH_HQUERY::default();
@@ -269,16 +280,28 @@ impl Counters {
         unsafe { PdhCollectQueryData(self.query) == PDH_OK }
     }
 
-    /// One reading for the adapter tagged `luid`: `(utilisation %, bytes of memory in use)`.
+    /// One reading for the adapter tagged `luid`.
     ///
     /// `unified` picks which memory counter is the real one for this adapter — see the
-    /// fields of [`Counters`].
-    fn sample(&mut self, luid: &str, unified: bool) -> (Option<f32>, Option<u64>) {
+    /// fields of [`Counters`]. On a discrete adapter the shared counter is reported
+    /// separately as the sysmem-fallback signal.
+    fn sample(&mut self, luid: &str, unified: bool) -> Sample {
         if !self.collect() {
-            return (None, None);
+            return Sample::default();
         }
-        let memory = if unified { self.shared } else { self.dedicated };
-        (self.busiest_engine(luid), self.memory_used(memory, luid))
+        let (used, spilled) = if unified {
+            (self.memory_used(self.shared, luid), None)
+        } else {
+            (
+                self.memory_used(self.dedicated, luid),
+                self.memory_used(self.shared, luid),
+            )
+        };
+        Sample {
+            util_pct: self.busiest_engine(luid),
+            used,
+            spilled,
+        }
     }
 
     /// Utilisation of the busiest engine type, in percent.
