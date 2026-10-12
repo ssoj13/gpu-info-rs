@@ -2,6 +2,9 @@
 
 ## 2026-10-12
 
+- `ComputeGpu::instance` (additive): the wgpu instance the compute adapter came from, so a consumer that adopts an
+  existing device and needs all four handles of one setup (the OIDN denoiser's cubecl `WgpuSetup`) can use the compute
+  device instead of the UI's shared one.
 - `auto_compute_device()`: the compute device for an Auto decision - `compute_device_status` when its adapter is
   hardware, else `Err(reason)` ("only a software adapter (<name>) is available: Auto computes on the CPU"). A GPU-less
   machine (CI runner, VM, farm server) still gets a software adapter (WARP / llvmpipe, `DeviceType::Cpu`) from the

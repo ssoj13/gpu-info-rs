@@ -527,6 +527,7 @@ pub fn compute_device_status() -> Result<&'static ComputeGpu, &'static str> {
                 device,
                 queue,
                 adapter,
+                instance,
             })
         })
         .as_ref()
@@ -583,6 +584,9 @@ pub struct ComputeGpu {
     pub queue: wgpu::Queue,
     /// The adapter it was created from (limits, info).
     pub adapter: wgpu::Adapter,
+    /// The instance the adapter came from, for a consumer that must be handed all four handles of one setup (an ML
+    /// runtime that adopts an existing device, as cubecl's `WgpuSetup` does).
+    pub instance: wgpu::Instance,
 }
 
 /// Major wgpu version this crate targets. Pinned to the `wgpu = "30"` dependency in
