@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-10-12
+
+- `auto_compute_device()`: the compute device for an Auto decision - `compute_device_status` when its adapter is
+  hardware, else `Err(reason)` ("only a software adapter (<name>) is available: Auto computes on the CPU"). A GPU-less
+  machine (CI runner, VM, farm server) still gets a software adapter (WARP / llvmpipe, `DeviceType::Cpu`) from the
+  non-fallback request; Auto must take the CPU there. `compute_device` / `compute_device_status` are unchanged (an
+  explicit WGPU choice keeps the adapter). The predicate is the pure `software_reason(&AdapterInfo)`, unit-tested.
+
 ## 2026-10-10
 
 - `GpuLimits::tiling_reason_rows(width, height, row_bytes)`: the fit of a buffer whose rows are PADDED (a Byte RGB

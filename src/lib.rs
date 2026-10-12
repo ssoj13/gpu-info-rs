@@ -533,6 +533,47 @@ pub fn compute_device_status() -> Result<&'static ComputeGpu, &'static str> {
         .map_err(String::as_str)
 }
 
+/// The compute device for an **Auto** decision: [`compute_device_status`] when its adapter is hardware, else the
+/// reason Auto must use the CPU.
+///
+/// **Why:** on a machine without a GPU (CI runners, VMs, render-farm servers, RDP sessions) the non-fallback
+/// `HighPerformance` request still returns a software rasterizer (WARP on DX12, llvmpipe / lavapipe on Vulkan / GL:
+/// `wgpu::DeviceType::Cpu`). Compiling the heavy shaders for it takes minutes (FXC on the 3D fractal) and a software
+/// rasterizer is slower than the CPU engines anyway, so "a device exists" is not "a GPU exists". An explicit WGPU
+/// choice keeps using [`compute_device`] / [`compute_device_status`], which still return that adapter.
+///
+/// Computed once from the one cached negotiation; the reason names the adapter and is shown in the effects' Auto label.
+#[cfg(feature = "wgpu")]
+pub fn auto_compute_device() -> Result<&'static ComputeGpu, &'static str> {
+    static AUTO: std::sync::OnceLock<Result<&'static ComputeGpu, String>> =
+        std::sync::OnceLock::new();
+    AUTO.get_or_init(|| {
+        let gpu = compute_device_status().map_err(str::to_owned)?;
+        match software_reason(&gpu.adapter.get_info()) {
+            Some(reason) => {
+                log::info!("gpu-info: Auto computes on the CPU: {reason}");
+                Err(reason)
+            }
+            None => Ok(gpu),
+        }
+    })
+    .as_ref()
+    .map(|gpu| *gpu)
+    .map_err(String::as_str)
+}
+
+/// Why Auto must not compute on `info`'s adapter: `Some` for a software rasterizer
+/// (`DeviceType::Cpu`), `None` for any hardware or virtualized GPU. The pure half of [`auto_compute_device`].
+#[cfg(feature = "wgpu")]
+fn software_reason(info: &wgpu::AdapterInfo) -> Option<String> {
+    (info.device_type == wgpu::DeviceType::Cpu).then(|| {
+        format!(
+            "only a software adapter ({}) is available: Auto computes on the CPU",
+            info.name
+        )
+    })
+}
+
 /// The device of [`compute_device`]: `Arc`-backed handles, clone to adopt.
 #[cfg(feature = "wgpu")]
 pub struct ComputeGpu {
@@ -555,6 +596,30 @@ const WGPU_VERSION: &str = "30";
 #[cfg(all(test, feature = "wgpu"))]
 mod tests {
     use super::*;
+
+    /// `software_reason` over every `DeviceType`: only a software rasterizer is refused, and the reason names it.
+    #[test]
+    fn auto_refuses_only_software_adapters() {
+        let adapter = |device_type| {
+            let mut info = wgpu::AdapterInfo::new(device_type, wgpu::Backend::Vulkan);
+            info.name = "Test Adapter".into();
+            info
+        };
+        let reason = software_reason(&adapter(wgpu::DeviceType::Cpu))
+            .expect("a software adapter is refused");
+        assert!(
+            reason.contains("Test Adapter") && reason.contains("CPU"),
+            "{reason}"
+        );
+        for hardware in [
+            wgpu::DeviceType::DiscreteGpu,
+            wgpu::DeviceType::IntegratedGpu,
+            wgpu::DeviceType::VirtualGpu,
+            wgpu::DeviceType::Other,
+        ] {
+            assert_eq!(software_reason(&adapter(hardware)), None, "{hardware:?}");
+        }
+    }
 
     /// A GPU-free synthetic report for testing serialization and diffing.
     fn sample() -> GpuReport {
