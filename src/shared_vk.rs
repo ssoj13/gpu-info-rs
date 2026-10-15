@@ -74,7 +74,7 @@ static PRIORITY_PAIR: [f32; 2] = [1.0, 1.0];
 /// index 0 of it. A constant rather than a guess, and CHECKED after the device is open against
 /// `Device::queue_family_index()`: if wgpu ever stops doing this, sharing must stop rather than
 /// quietly hand a consumer the renderer's own queue.
-const WGPU_FAMILY: u32 = 0;
+pub(crate) const WGPU_FAMILY: u32 = 0;
 
 /// The raw Vulkan objects behind the shared device, for consumers that speak Vulkan directly.
 ///

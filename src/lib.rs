@@ -76,6 +76,17 @@ pub mod shared_vk;
 ))]
 #[path = "shared_vk_unavailable.rs"]
 pub mod shared_vk;
+/// The compute device's Vulkan opening (ofx-rs VK1): `VK_NV_optical_flow` and one optical-flow queue when the adapter
+/// reports them, and the device's raw handles ([`ComputeGpu::optical_flow`], [`ComputeGpu::raw`]).
+#[cfg(feature = "wgpu")]
+pub mod compute_vk;
+#[cfg(all(
+    feature = "wgpu",
+    any(windows, target_os = "linux", target_os = "android", target_os = "freebsd")
+))]
+pub use compute_vk::{VulkanHandles, optical_flow_family, wants_optical_flow};
+#[cfg(feature = "wgpu")]
+pub use compute_vk::OpticalFlow;
 #[cfg(feature = "wgpu")]
 mod vram;
 /// The one submit-and-wait of the cluster: [`submit`] + [`wait`](fn@wait) / [`wait_idle`] and [`map_read`],
@@ -514,24 +525,47 @@ pub fn compute_device_status() -> Result<&'static ComputeGpu, &'static str> {
             let _creating = DEVICE_CREATION
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let (device, queue) =
-                pollster::block_on(request_max_device(&adapter, stable_features())).map_err(
-                    |error| {
-                        format!(
-                            "cannot create compute device on {}: {error}",
-                            adapter.get_info().name
-                        )
-                    },
-                )?;
-            Ok(ComputeGpu {
-                device,
-                queue,
-                adapter,
-                instance,
-            })
+            let features = stable_features() & adapter.features();
+            open_compute_device(adapter, instance, features)
         })
         .as_ref()
         .map_err(String::as_str)
+}
+
+/// The compute device of `adapter` with `features` (already intersected with the adapter's) and the adapter's maximum limits: through
+/// [`compute_vk`] on a Vulkan adapter (the optical-flow queue and the raw handles when available), the plain
+/// [`request_max_device`] elsewhere.
+#[cfg(feature = "wgpu")]
+fn open_compute_device(
+    adapter: wgpu::Adapter,
+    instance: wgpu::Instance,
+    features: wgpu::Features,
+) -> Result<ComputeGpu, String> {
+    #[cfg(any(windows, target_os = "linux", target_os = "android", target_os = "freebsd"))]
+    {
+        let (device, queue, optical_flow, raw) = compute_vk::open_compute(&adapter, features, &adapter.limits())?;
+        Ok(ComputeGpu {
+            device,
+            queue,
+            adapter,
+            instance,
+            optical_flow,
+            raw,
+        })
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "android", target_os = "freebsd")))]
+    {
+        let (device, queue) = pollster::block_on(request_max_device(&adapter, features)).map_err(|error| {
+            format!("cannot create compute device on {}: {error}", adapter.get_info().name)
+        })?;
+        Ok(ComputeGpu {
+            device,
+            queue,
+            adapter,
+            instance,
+            optical_flow: None,
+        })
+    }
 }
 
 /// The compute device for an **Auto** decision: [`compute_device_status`] when its adapter is hardware, else the
@@ -587,6 +621,14 @@ pub struct ComputeGpu {
     /// The instance the adapter came from, for a consumer that must be handed all four handles of one setup (an ML
     /// runtime that adopts an existing device, as cubecl's `WgpuSetup` does).
     pub instance: wgpu::Instance,
+    /// The optical-flow queue (`VK_NV_optical_flow`) the device was opened with, when the adapter reports the extension,
+    /// its feature, a family apart from wgpu's and Vulkan 1.3 ([`compute_vk`]); `None` otherwise. Its one user is
+    /// ofx-rs `ofx-motion` `vk_nv`, which owns the queue's submit lock.
+    pub optical_flow: Option<OpticalFlow>,
+    /// The device's raw Vulkan handles, read once at opening ([`compute_vk::VulkanHandles`]); `None` on a DX12 device.
+    /// Consumers take them here instead of calling `as_hal` (ofx-motion `vk_nv`, the vfx-compute Vulkan executor).
+    #[cfg(any(windows, target_os = "linux", target_os = "android", target_os = "freebsd"))]
+    pub raw: Option<VulkanHandles>,
 }
 
 /// Major wgpu version this crate targets. Pinned to the `wgpu = "30"` dependency in

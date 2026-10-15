@@ -9,6 +9,23 @@ reuse/dirty-clear/completion gate passed. Strict all-target/all-feature Clippy
 passed. The OS RAM smoke checks its formula on one snapshot rather than
 comparing independently changing live readings.
 
+## The compute device's optical-flow queue and raw handles (VK1, 2026-10-15, branch `waveR-vk1`)
+
+`compute_device_status` opens the device through `compute_vk::open_compute` (`open_with_callback`, the `shared_vk`
+pattern) on a Vulkan adapter; DX12 / Metal keep `request_max_device`. When the adapter reports ALL of
+`VK_NV_optical_flow`, `VkPhysicalDeviceOpticalFlowFeaturesNV::opticalFlow` (queried through
+`vkGetPhysicalDeviceFeatures2`), a family with `OPTICAL_FLOW_BIT_NV` that is not wgpu's (A5: wgpu's family 0,
+`shared_vk::WGPU_FAMILY`, verified after opening) and Vulkan 1.3 (`wants_optical_flow`), the callback adds the
+extension, chains the feature struct (a local borrowed by the callback, not leaked) and one queue of that family.
+`ComputeGpu::optical_flow: Option<OpticalFlow { family, index }>` is set only when the enabled extension list
+(recorded inside the callback) really carries it; `ComputeGpu::raw: Option<VulkanHandles { instance, device, physical,
+family, api }>` (Vulkan targets) replaces every consumer's `as_hal` for the compute device. A device without the
+extension opens with the same features and limits as before. Trap: the optical-flow queue is externally synchronised;
+its one submitter is ofx-rs `ofx-motion` `vk_nv` (it owns the submit lock); wgpu never touches it.
+Tests: `compute_vk::vulkan::tests` (family selection, A5, every condition required; mutant: `feature` ignored),
+`tests/optical_flow.rs` (ignored, NVIDIA Turing+: the queue exists apart from wgpu's family and wgpu still computes;
+mutant: the queue create info not pushed).
+
 ## VramWatch (2026-10-10)
 
 `VramWatch::new(label, every)` (const) + `budget(GpuVramContext)` = the OS VRAM budget cached for `every`, failures
