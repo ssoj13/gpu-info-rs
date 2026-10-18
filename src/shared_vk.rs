@@ -35,12 +35,27 @@ use wgpu::hal::api::Vulkan;
 /// Both codec extensions are listed because the device is created once, at startup, before anyone
 /// knows which clip will be opened. A codec whose extension the adapter lacks is simply dropped
 /// from the request (see [`present_video_ext`]) rather than failing the whole negotiation.
-const VIDEO_EXT: [&CStr; 4] = [
+const VIDEO_EXT: [&CStr; 6] = [
     c"VK_KHR_video_queue",
     c"VK_KHR_video_decode_queue",
     c"VK_KHR_video_decode_h265",
     c"VK_KHR_video_decode_h264",
+    c"VK_KHR_video_decode_av1",
+    c"VK_KHR_video_decode_vp9",
 ];
+
+/// `VkPhysicalDeviceVideoDecodeVP9FeaturesKHR` (`VK_KHR_video_decode_vp9`, Vulkan 1.4.316;
+/// `sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_DECODE_VP9_FEATURES_KHR = 1000514000`).
+#[repr(C)]
+struct PhysicalDeviceVideoDecodeVp9FeaturesKHR {
+    s_type: vk::StructureType,
+    p_next: *mut core::ffi::c_void,
+    video_decode_vp9: vk::Bool32,
+}
+
+// SAFETY: plain C feature struct whose `p_next` is wired inside the single-threaded `open_with_callback` closure.
+unsafe impl Send for PhysicalDeviceVideoDecodeVp9FeaturesKHR {}
+unsafe impl Sync for PhysicalDeviceVideoDecodeVp9FeaturesKHR {}
 
 /// Extensions for OTHER APIs sharing this device's memory, added where the adapter has them.
 ///
@@ -302,10 +317,17 @@ pub(crate) fn open_shared(
     // is long-lived enough. It used to be `Box::leak`ed, which leaked once per call for nothing.
     let mut sync2 = vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
     let sync2_ref = &mut sync2;
+    let mut vp9_feat = PhysicalDeviceVideoDecodeVp9FeaturesKHR {
+        s_type: vk::StructureType::from_raw(1_000_514_000),
+        p_next: core::ptr::null_mut(),
+        video_decode_vp9: vk::TRUE,
+    };
+    let vp9_feat_ref = &mut vp9_feat;
 
     let (video_ext, decode, compute, sync2_on, open) = unsafe {
         let hal = adapter.as_hal::<Vulkan>()?;
         let video_ext = present_video_ext(&hal);
+        let vp9_on = video_ext.contains(&c"VK_KHR_video_decode_vp9");
         if !VIDEO_CORE.iter().all(|e| video_ext.contains(e)) {
             log::info!("gpu-info: adapter has no Vulkan video extensions; no shared decode device");
             return None;
@@ -407,6 +429,11 @@ pub(crate) fn open_shared(
                     if sync2_on {
                         let taken = core::mem::take(args.create_info);
                         *args.create_info = taken.push_next(sync2_ref);
+                    }
+                    if vp9_on {
+                        vp9_feat_ref.p_next = args.create_info.p_next.cast_mut();
+                        args.create_info.p_next =
+                            (vp9_feat_ref as *const PhysicalDeviceVideoDecodeVp9FeaturesKHR).cast();
                     }
                     if let Ok(mut all) = extensions_writer.lock() {
                         *all = args
