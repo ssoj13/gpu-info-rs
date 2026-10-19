@@ -23,12 +23,18 @@
 //! handful of C functions with a stable ABI, and NVML's own headers have kept these
 //! signatures across major versions.
 
-use std::ffi::{c_char, c_uint, c_void};
+use std::ffi::{c_char, c_uint, c_ulonglong, c_void};
 
 /// One enrichment reading. Every field is `Option` because NVML answers per capability:
 /// a passively cooled card reports no fan, a laptop GPU may report no enforced power limit.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct NvmlStats {
+    /// Device core utilisation in percent (`0.0..=100.0`), when reported by NVML.
+    pub util_pct: Option<f32>,
+    /// VRAM bytes in use, when reported by `nvmlDeviceGetMemoryInfo`.
+    pub mem_used_bytes: Option<u64>,
+    /// Total dedicated VRAM bytes, when reported by `nvmlDeviceGetMemoryInfo`.
+    pub mem_total_bytes: Option<u64>,
     /// Core temperature in °C.
     pub temp_c: Option<f32>,
     /// Board power draw in watts.
@@ -55,48 +61,47 @@ impl NvmlStats {
     }
 }
 
-/// Reads the enrichment counters for the device whose name matches `adapter`.
-///
-/// Matching by name rather than taking index 0: on a machine with two NVIDIA cards the
-/// enumeration order is NVML's, not DXGI's, and reporting one card's temperature next to the
-/// other's memory would be worse than reporting no temperature.
+/// Reads the enrichment counters for the first device whose name matches `adapter`.
+#[cfg(test)]
 pub fn query(adapter: &str) -> Option<NvmlStats> {
+    query_nth(adapter, 0)
+}
+
+/// Reads the enrichment counters for the `ordinal`-th device whose name matches `adapter`.
+///
+/// On a multi-GPU node with identical NVIDIA cards (e.g. 4× RTX 4090), `ordinal` selects
+/// which matching NVML handle corresponds to the `ordinal`-th DXGI adapter of that model.
+pub fn query_nth(adapter: &str, ordinal: usize) -> Option<NvmlStats> {
     let lib = Nvml::get()?;
-    let device = lib.device_matching(adapter)?;
-    let mut out = NvmlStats {
-        driver: lib.driver_version(),
-        ..Default::default()
+    let device = lib.device_matching(adapter, ordinal)?;
+    lib.sample_device(device)
+}
+
+/// Enumerates every NVIDIA GPU known to NVML along with its live counters.
+///
+/// Primary path on Linux NVIDIA hosts (where DRM sysfs does not publish `gpu_busy_percent`
+/// or `mem_info_vram_*`) — still 100% spawn-free via `libnvidia-ml.so.1`.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn query_all() -> Vec<(String, NvmlStats)> {
+    let Some(lib) = Nvml::get() else {
+        return Vec::new();
     };
-
-    let mut value: c_uint = 0;
-    // SAFETY (all calls below): `device` is a handle NVML itself returned and has not been
-    // invalidated — NVML stays initialised for the process's lifetime — and each out
-    // parameter is a valid local of the type the entry point documents. Every call reports
-    // failure through its return code, which is checked before the value is read.
-    if unsafe { (lib.temperature)(device, NVML_TEMPERATURE_GPU, &mut value) } == NVML_SUCCESS {
-        out.temp_c = Some(value as f32);
+    let mut count: c_uint = 0;
+    if unsafe { (lib.count)(&mut count) } != NVML_SUCCESS {
+        return Vec::new();
     }
-    if unsafe { (lib.power_usage)(device, &mut value) } == NVML_SUCCESS {
-        out.power_w = Some(value as f32 / 1000.0);
+    let mut out = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let mut device: Device = std::ptr::null_mut();
+        if unsafe { (lib.handle)(index, &mut device) } != NVML_SUCCESS {
+            continue;
+        }
+        let name = lib.name_of(device).unwrap_or_else(|| format!("NVIDIA GPU {index}"));
+        if let Some(stats) = lib.sample_device(device) {
+            out.push((name, stats));
+        }
     }
-    if unsafe { (lib.power_limit)(device, &mut value) } == NVML_SUCCESS {
-        out.power_limit_w = Some(value as f32 / 1000.0);
-    }
-    if unsafe { (lib.fan_speed)(device, &mut value) } == NVML_SUCCESS {
-        out.fan_pct = Some(value as f32);
-    }
-    if unsafe { (lib.clock_info)(device, NVML_CLOCK_GRAPHICS, &mut value) } == NVML_SUCCESS {
-        out.clock_core_mhz = Some(value);
-    }
-    if unsafe { (lib.clock_info)(device, NVML_CLOCK_MEM, &mut value) } == NVML_SUCCESS {
-        out.clock_mem_mhz = Some(value);
-    }
-    let mut rates = NvmlUtilization::default();
-    if unsafe { (lib.utilization)(device, &mut rates) } == NVML_SUCCESS {
-        out.mem_bus_pct = Some(rates.memory as f32);
-    }
-
-    (!out.is_empty()).then_some(out)
+    out
 }
 
 // ── The library ────────────────────────────────────────────────────────────────────────
@@ -118,6 +123,14 @@ struct NvmlUtilization {
     memory: c_uint,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct NvmlMemory {
+    total: c_ulonglong,
+    free: c_ulonglong,
+    used: c_ulonglong,
+}
+
 type FnInit = unsafe extern "C" fn() -> c_uint;
 type FnCount = unsafe extern "C" fn(*mut c_uint) -> c_uint;
 type FnHandle = unsafe extern "C" fn(c_uint, *mut Device) -> c_uint;
@@ -125,6 +138,7 @@ type FnName = unsafe extern "C" fn(Device, *mut c_char, c_uint) -> c_uint;
 type FnU32 = unsafe extern "C" fn(Device, *mut c_uint) -> c_uint;
 type FnU32Arg = unsafe extern "C" fn(Device, c_uint, *mut c_uint) -> c_uint;
 type FnUtil = unsafe extern "C" fn(Device, *mut NvmlUtilization) -> c_uint;
+type FnMem = unsafe extern "C" fn(Device, *mut NvmlMemory) -> c_uint;
 type FnDriver = unsafe extern "C" fn(*mut c_char, c_uint) -> c_uint;
 
 /// The entry points, resolved once.
@@ -139,6 +153,7 @@ struct Nvml {
     fan_speed: FnU32,
     clock_info: FnU32Arg,
     utilization: FnUtil,
+    memory_info: Option<FnMem>,
 }
 
 // SAFETY: the fields are plain function pointers into a library that is never unloaded, and
@@ -179,14 +194,60 @@ impl Nvml {
                 fan_speed: symbol(lib, c"nvmlDeviceGetFanSpeed")?,
                 clock_info: symbol(lib, c"nvmlDeviceGetClockInfo")?,
                 utilization: symbol(lib, c"nvmlDeviceGetUtilizationRates")?,
+                memory_info: symbol(lib, c"nvmlDeviceGetMemoryInfo"),
             })
         }
     }
 
-    /// The device whose NVML name matches `adapter`, comparing on the model rather than on
-    /// the exact string: DXGI and NVML agree on "NVIDIA GeForce RTX 3080 Ti" today, and a
-    /// vendor prefix or a trailing revision is not worth losing the match over.
-    fn device_matching(&self, adapter: &str) -> Option<Device> {
+    fn sample_device(&self, device: Device) -> Option<NvmlStats> {
+        let mut out = NvmlStats {
+            driver: self.driver_version(),
+            ..Default::default()
+        };
+
+        let mut value: c_uint = 0;
+        // SAFETY (all calls below): `device` is a handle NVML itself returned and has not been
+        // invalidated — NVML stays initialised for the process's lifetime — and each out
+        // parameter is a valid local of the type the entry point documents. Every call reports
+        // failure through its return code, which is checked before the value is read.
+        if unsafe { (self.temperature)(device, NVML_TEMPERATURE_GPU, &mut value) } == NVML_SUCCESS {
+            out.temp_c = Some(value as f32);
+        }
+        if unsafe { (self.power_usage)(device, &mut value) } == NVML_SUCCESS {
+            out.power_w = Some(value as f32 / 1000.0);
+        }
+        if unsafe { (self.power_limit)(device, &mut value) } == NVML_SUCCESS {
+            out.power_limit_w = Some(value as f32 / 1000.0);
+        }
+        if unsafe { (self.fan_speed)(device, &mut value) } == NVML_SUCCESS {
+            out.fan_pct = Some(value as f32);
+        }
+        if unsafe { (self.clock_info)(device, NVML_CLOCK_GRAPHICS, &mut value) } == NVML_SUCCESS {
+            out.clock_core_mhz = Some(value);
+        }
+        if unsafe { (self.clock_info)(device, NVML_CLOCK_MEM, &mut value) } == NVML_SUCCESS {
+            out.clock_mem_mhz = Some(value);
+        }
+        let mut rates = NvmlUtilization::default();
+        if unsafe { (self.utilization)(device, &mut rates) } == NVML_SUCCESS {
+            out.util_pct = Some((rates.gpu as f32).clamp(0.0, 100.0));
+            out.mem_bus_pct = Some((rates.memory as f32).clamp(0.0, 100.0));
+        }
+        if let Some(mem_fn) = self.memory_info {
+            let mut mem = NvmlMemory::default();
+            if unsafe { mem_fn(device, &mut mem) } == NVML_SUCCESS && mem.total > 0 {
+                out.mem_total_bytes = Some(mem.total);
+                out.mem_used_bytes = Some(mem.used);
+            }
+        }
+
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// The `ordinal`-th device whose NVML name matches `adapter`, comparing on the model
+    /// rather than on the exact string: DXGI and NVML agree on "NVIDIA GeForce RTX 3080 Ti"
+    /// today, and a vendor prefix or a trailing revision is not worth losing the match over.
+    fn device_matching(&self, adapter: &str, ordinal: usize) -> Option<Device> {
         let mut count: c_uint = 0;
         // SAFETY: `count` is a valid local; the call reports failure through its return code.
         if unsafe { (self.count)(&mut count) } != NVML_SUCCESS {
@@ -194,6 +255,7 @@ impl Nvml {
         }
         let wanted = normalise(adapter);
         let mut first = None;
+        let mut seen_matches = 0usize;
         for index in 0..count {
             let mut device: Device = std::ptr::null_mut();
             // SAFETY: `index` is below the count NVML just reported.
@@ -202,12 +264,15 @@ impl Nvml {
             }
             first.get_or_insert(device);
             if self.name_of(device).map(|n| normalise(&n)) == Some(wanted.clone()) {
-                return Some(device);
+                if seen_matches == ordinal {
+                    return Some(device);
+                }
+                seen_matches += 1;
             }
         }
         // A single NVIDIA device that reports a different name than DXGI does is still
         // unambiguously the card the base reading came from.
-        (count == 1).then_some(first?)
+        (count == 1 && ordinal == 0).then_some(first?)
     }
 
     fn name_of(&self, device: Device) -> Option<String> {
@@ -274,6 +339,39 @@ mod platform {
         );
         // SAFETY: the caller guarantees `F` matches the symbol, and the size check above
         // pins `F` to a bare function pointer rather than a fat one.
+        Some(unsafe { std::mem::transmute_copy::<_, F>(&raw) })
+    }
+}
+
+#[cfg(unix)]
+mod platform {
+    use std::ffi::{CStr, c_void};
+
+    pub type Handle = *mut c_void;
+
+    /// Loads `libnvidia-ml.so.1` (or `libnvidia-ml.so`) on Linux/Unix without linking against it.
+    pub fn load_library() -> Option<Handle> {
+        let flags = libc::RTLD_LAZY | libc::RTLD_LOCAL;
+        // SAFETY: static NUL-terminated library names; returns null when absent.
+        let h = unsafe { libc::dlopen(c"libnvidia-ml.so.1".as_ptr(), flags) };
+        if !h.is_null() {
+            return Some(h);
+        }
+        let h2 = unsafe { libc::dlopen(c"libnvidia-ml.so".as_ptr(), flags) };
+        (!h2.is_null()).then_some(h2)
+    }
+
+    /// Resolves one entry point via `dlsym`.
+    pub unsafe fn symbol<F: Copy>(lib: Handle, name: &CStr) -> Option<F> {
+        let raw = unsafe { libc::dlsym(lib, name.as_ptr()) };
+        if raw.is_null() {
+            return None;
+        }
+        debug_assert_eq!(
+            size_of::<F>(),
+            size_of::<*mut c_void>(),
+            "a function pointer is one word"
+        );
         Some(unsafe { std::mem::transmute_copy::<_, F>(&raw) })
     }
 }

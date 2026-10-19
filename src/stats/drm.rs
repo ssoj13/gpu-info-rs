@@ -19,7 +19,11 @@ use super::GpuStats;
 const MAX_CARDS: u32 = 8;
 
 pub(super) fn query() -> Option<GpuStats> {
-    (0..MAX_CARDS).find_map(|index| card(index))
+    (0..MAX_CARDS).find_map(card)
+}
+
+pub(super) fn query_all() -> Vec<GpuStats> {
+    (0..MAX_CARDS).filter_map(card).collect()
 }
 
 fn card(index: u32) -> Option<GpuStats> {

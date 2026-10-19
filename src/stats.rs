@@ -28,7 +28,7 @@
 mod apple;
 #[cfg(target_os = "linux")]
 mod drm;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 mod nvml;
 #[cfg(target_os = "windows")]
 mod windows;
@@ -46,11 +46,11 @@ pub(crate) fn windows_adapter_memory() -> Option<(String, u64, u64, u64, bool)> 
 /// Enrichment, not a fallback: the base reading is complete on its own for every vendor, and
 /// this only adds what PDH has no counter for.
 #[cfg(target_os = "windows")]
-fn enrich(stats: &mut GpuStats) {
+fn enrich_nth(stats: &mut GpuStats, ordinal: usize) {
     let Some(name) = stats.name.as_deref() else {
         return;
     };
-    let Some(n) = nvml::query(name) else {
+    let Some(n) = nvml::query_nth(name, ordinal) else {
         return;
     };
     stats.temp_c = n.temp_c;
@@ -112,9 +112,9 @@ pub struct GpuStats {
     /// Core temperature in °C.
     ///
     /// The fields below come from a vendor library where one is present — see
-    /// [`nvml`](self) on Windows. Windows publishes no thermal, clock, power or fan counter
-    /// of its own, so they are `None` on an AMD or Intel GPU until ADL and IGCL are wired in
-    /// the same shape.
+    /// [`nvml`](self) on Windows and Linux. Windows publishes no thermal, clock, power or fan
+    /// counter of its own, so they are `None` on an AMD or Intel GPU until ADL and IGCL are
+    /// wired in the same shape.
     pub temp_c: Option<f32>,
     /// Board power draw in watts.
     pub power_w: Option<f32>,
@@ -160,23 +160,60 @@ impl GpuStats {
 ///
 /// Cheap enough to call every frame; see the module docs for the per-platform sources.
 pub fn query() -> Option<GpuStats> {
+    query_all().into_iter().next()
+}
+
+/// Reads live counters for every GPU on the machine without spawning any processes.
+///
+/// * **Windows:** DXGI + PDH across all hardware adapters in a single PDH collection pass,
+///   enriched per-adapter from NVML (`nvml.dll`) when present.
+/// * **Linux:** DRM sysfs (`amdgpu` / `i915` / `xe`) plus NVML (`libnvidia-ml.so.1`) for
+///   NVIDIA adapters.
+/// * **macOS:** IOKit `IOAccelerator` performance statistics.
+pub fn query_all() -> Vec<GpuStats> {
     #[cfg(target_os = "macos")]
     {
-        apple::query()
+        apple::query().into_iter().collect()
     }
     #[cfg(target_os = "linux")]
     {
-        drm::query()
+        let mut out: Vec<GpuStats> = nvml::query_all()
+            .into_iter()
+            .map(|(name, n)| GpuStats {
+                name: Some(name),
+                util_pct: n.util_pct,
+                mem_used_bytes: n.mem_used_bytes,
+                mem_total_bytes: n.mem_total_bytes,
+                mem_shared_bytes: None,
+                unified: false,
+                temp_c: n.temp_c,
+                power_w: n.power_w,
+                power_limit_w: n.power_limit_w,
+                fan_pct: n.fan_pct,
+                clock_core_mhz: n.clock_core_mhz,
+                clock_mem_mhz: n.clock_mem_mhz,
+                mem_bus_pct: n.mem_bus_pct,
+                driver: n.driver,
+            })
+            .collect();
+        out.extend(drm::query_all());
+        out
     }
     #[cfg(target_os = "windows")]
     {
-        let mut stats = windows::query()?;
-        enrich(&mut stats);
-        Some(stats)
+        let mut list = windows::query_all();
+        let mut seen_by_name: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for s in &mut list {
+            let key = s.name.clone().unwrap_or_default().to_ascii_lowercase();
+            let ord = *seen_by_name.entry(key).and_modify(|c| *c += 1).or_insert(0);
+            enrich_nth(s, ord);
+        }
+        list
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
-        None
+        Vec::new()
     }
 }
 

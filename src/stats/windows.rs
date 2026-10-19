@@ -61,46 +61,69 @@ use super::GpuStats;
 const PDH_OK: u32 = 0;
 
 thread_local! {
-    /// Cached adapter identity. `RefCell<Option<..>>` rather than `OnceCell` so a failed
+    /// Cached adapter identities. `RefCell<Option<..>>` rather than `OnceCell` so a failed
     /// probe is retried on the next poll instead of poisoning the backend for good.
-    static ADAPTER: RefCell<Option<Adapter>> = const { RefCell::new(None) };
+    static ADAPTERS: RefCell<Option<Vec<Adapter>>> = const { RefCell::new(None) };
     /// Cached PDH query. Thread-local because PDH handles are not `Sync`, and the sampler
     /// polls from one thread anyway.
     static COUNTERS: RefCell<Option<Counters>> = const { RefCell::new(None) };
 }
 
-/// Reads the primary GPU's live counters, or `None` when no adapter answers.
-pub fn query() -> Option<GpuStats> {
-    let adapter = ADAPTER.with(|slot| {
+fn cached_adapters() -> Vec<Adapter> {
+    ADAPTERS.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
-            *slot = Adapter::open();
+            let list = Adapter::open_all();
+            if !list.is_empty() {
+                *slot = Some(list);
+            }
         }
-        slot.clone()
-    })?;
+        slot.clone().unwrap_or_default()
+    })
+}
 
-    let sample = COUNTERS.with(|slot| {
+/// Reads live counters for all hardware GPUs on the machine in a single PDH collection pass.
+pub fn query_all() -> Vec<GpuStats> {
+    let adapters = cached_adapters();
+    if adapters.is_empty() {
+        return Vec::new();
+    }
+
+    let samples: Vec<Sample> = COUNTERS.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
             *slot = Counters::open();
         }
-        slot.as_mut()
-            .map(|c| c.sample(&adapter.luid_tag, adapter.unified))
-            .unwrap_or_default()
+        let Some(c) = slot.as_mut() else {
+            return vec![Sample::default(); adapters.len()];
+        };
+        if !c.collect() {
+            return vec![Sample::default(); adapters.len()];
+        }
+        adapters
+            .iter()
+            .map(|a| c.sample_collected(&a.luid_tag, a.unified))
+            .collect()
     });
 
-    let stats = GpuStats {
-        name: Some(adapter.name),
-        util_pct: sample.util_pct,
-        mem_used_bytes: sample.used,
-        mem_shared_bytes: sample.spilled,
-        mem_total_bytes: Some(adapter.total_bytes).filter(|b| *b > 0),
-        unified: adapter.unified,
-        // Windows publishes no thermal, clock, power or fan counter; `super::enrich` fills
-        // these in from a vendor library when one is installed.
-        ..Default::default()
-    };
-    (!stats.is_empty()).then_some(stats)
+    adapters
+        .into_iter()
+        .zip(samples)
+        .filter_map(|(adapter, sample)| {
+            let stats = GpuStats {
+                name: Some(adapter.name),
+                util_pct: sample.util_pct,
+                mem_used_bytes: sample.used,
+                mem_shared_bytes: sample.spilled,
+                mem_total_bytes: Some(adapter.total_bytes).filter(|b| *b > 0),
+                unified: adapter.unified,
+                // Windows publishes no thermal, clock, power or fan counter; `super::enrich` fills
+                // these in from a vendor library when one is installed.
+                ..Default::default()
+            };
+            (!stats.is_empty()).then_some(stats)
+        })
+        .collect()
 }
 
 /// Adapter facts for [`crate::os`]'s Windows path, with no process spawn:
@@ -110,13 +133,7 @@ pub fn query() -> Option<GpuStats> {
 /// spawns, a second of wall clock, and NVIDIA-only for the useful half. Everything it wants
 /// is already on the handles this module caches, so it may as well ask here first.
 pub(crate) fn adapter_memory() -> Option<(String, u64, u64, u64, bool)> {
-    let adapter = ADAPTER.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.is_none() {
-            *slot = Adapter::open();
-        }
-        slot.clone()
-    })?;
+    let adapter = cached_adapters().into_iter().next()?;
     let used = COUNTERS.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
@@ -153,17 +170,19 @@ struct Adapter {
 }
 
 impl Adapter {
-    /// Picks the hardware adapter with the most dedicated memory.
+    /// Enumerates all hardware GPUs via DXGI.
     ///
-    /// Enumeration order is not preference order: index 0 is frequently the integrated GPU
-    /// on a laptop that also has a discrete one. "Most VRAM" is the heuristic a renderer
-    /// uses to choose a device, so the monitor reports the GPU the work runs on. The
-    /// software (WARP) adapter is skipped — it is not a GPU.
-    fn open() -> Option<Self> {
+    /// When the machine has one or more discrete GPUs (`DedicatedVideoMemory > 0`), only the
+    /// discrete GPUs are returned (sorted by VRAM descending, stable so multi-GPU ordinals
+    /// match NVML). When the machine has only integrated/unified GPUs, those are returned.
+    /// The software (WARP) adapter is always skipped.
+    fn open_all() -> Vec<Self> {
         // SAFETY: `CreateDXGIFactory1` takes no arguments and yields a refcounted COM
         // interface the `windows` crate releases on drop.
-        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
-        let mut best: Option<Self> = None;
+        let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
+            return Vec::new();
+        };
+        let mut list: Vec<Self> = Vec::new();
         for index in 0.. {
             // SAFETY: enumeration by index; a missing index returns an error, which ends the
             // loop rather than reading out of bounds.
@@ -179,29 +198,28 @@ impl Adapter {
                 continue;
             }
             let dedicated = desc.DedicatedVideoMemory as u64;
-            if best
-                .as_ref()
-                .is_some_and(|b| !b.unified && b.total_bytes >= dedicated)
-            {
+            let unified = dedicated == 0;
+            let total_bytes = if unified {
+                desc.SharedSystemMemory as u64
+            } else {
+                dedicated
+            };
+            if total_bytes == 0 {
                 continue;
             }
-            // An integrated GPU has no VRAM at all, so its honest denominator is the system
-            // memory it is allowed to address. Reporting `dedicated` there would be a
-            // permanent zero, and a bar with a zero total renders as full.
-            let unified = dedicated == 0;
-            best = Some(Self {
+            list.push(Self {
                 name: describe(&desc.Description),
-                total_bytes: if unified {
-                    desc.SharedSystemMemory as u64
-                } else {
-                    dedicated
-                },
+                total_bytes,
                 shared_bytes: desc.SharedSystemMemory as u64,
                 unified,
                 luid_tag: luid_tag(desc.AdapterLuid),
             });
         }
-        best
+        if list.iter().any(|a| !a.unified) {
+            list.retain(|a| !a.unified);
+        }
+        list.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes));
+        list
     }
 }
 
@@ -280,15 +298,16 @@ impl Counters {
         unsafe { PdhCollectQueryData(self.query) == PDH_OK }
     }
 
-    /// One reading for the adapter tagged `luid`.
-    ///
-    /// `unified` picks which memory counter is the real one for this adapter — see the
-    /// fields of [`Counters`]. On a discrete adapter the shared counter is reported
-    /// separately as the sysmem-fallback signal.
+    /// One reading for the adapter tagged `luid` (collects PDH data first).
     fn sample(&mut self, luid: &str, unified: bool) -> Sample {
         if !self.collect() {
             return Sample::default();
         }
+        self.sample_collected(luid, unified)
+    }
+
+    /// Reads an adapter's counters from an already-collected PDH query.
+    fn sample_collected(&mut self, luid: &str, unified: bool) -> Sample {
         let (used, spilled) = if unified {
             (self.memory_used(self.shared, luid), None)
         } else {
