@@ -39,14 +39,14 @@ This source checkpoint has no new compile/hardware/performance receipt.
 Using `os` where you meant `stats` is the classic mistake: a `system_profiler` spawn per
 sample hitches the caller's UI thread. `stats` exists precisely to make that impossible.
 
-### Live counters by platform
+### Live counters by platform (`stats::query` and `stats::query_all`)
 
-| Platform | Utilisation | Memory in use | Source |
-| --- | --- | --- | --- |
-| macOS (Apple GPU) | yes | yes | IOKit `IOAccelerator` → `PerformanceStatistics`, unprivileged |
-| Linux (AMD / Intel) | yes | yes | DRM sysfs `gpu_busy_percent`, `mem_info_vram_*` |
-| NVIDIA (any OS) | no | no | needs NVML; `nvidia-smi` would break the no-spawn contract |
-| Windows (other) | no | no | PDH / DXGI budget not wired up yet |
+| Platform | Utilisation | Memory in use | Thermals / Power / Clocks | Source |
+| --- | --- | --- | --- | --- |
+| Windows (NVIDIA / AMD / Intel) | yes | yes (+ WDDM `mem_shared_bytes`) | yes (NVIDIA via `nvml.dll`) | DXGI + PDH `GPU Engine` / `GPU Adapter Memory` + NVML |
+| Linux (NVIDIA) | yes | yes | yes | `libnvidia-ml.so.1` (`dlopen`, zero process spawns) |
+| Linux (AMD / Intel) | yes | yes | — | DRM sysfs `gpu_busy_percent`, `mem_info_vram_*` |
+| macOS (Apple GPU) | yes | yes | — | IOKit `IOAccelerator` → `PerformanceStatistics`, unprivileged |
 
 Absent counters are reported as `None`, never as `0` — a UI should render them as `—`.
 

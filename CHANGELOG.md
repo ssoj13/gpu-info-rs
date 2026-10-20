@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-10-19
+
+- `gpu_info::stats::query_all() -> Vec<GpuStats>` (additive): enumerates live counters for all hardware GPUs on a host
+  without process spawns:
+  - **Windows:** `Adapter::open_all()` enumerates every hardware DXGI adapter (`DXGI_ADAPTER_FLAG_SOFTWARE` excluded),
+    collects PDH counter data once per poll (`PdhCollectQueryData`), samples each adapter's LUID counters in a single
+    pass, and enriches multi-GPU identical NVIDIA adapters via `nvml::query_nth(adapter, ordinal)` so e.g. 4× RTX 4090
+    receive their own individual NVML thermals, power, fans, and clocks instead of GPU 0's.
+  - **Linux:** dynamically loads `libnvidia-ml.so.1` / `libnvidia-ml.so` via `dlopen`/`dlsym` (`nvml::query_all()`) and
+    queries `nvmlDeviceGetUtilizationRates` + `nvmlDeviceGetMemoryInfo` alongside temperature, power, fan, clocks, and
+    driver version — providing full zero-spawn NVIDIA telemetry on Linux render nodes where DRM sysfs does not publish
+    `gpu_busy_percent` or `mem_info_vram_*`. Also enumerates DRM cards `card0..card7` for AMD/Intel GPUs.
+  - **macOS:** wraps IOKit `IOAccelerator` query into a single-element vector.
+
 ## 2026-10-12
 
 - `GpuStats::mem_shared_bytes` (additive): on Windows, the WDDM `GPU Adapter Memory \ Shared Usage` of a
