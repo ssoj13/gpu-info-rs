@@ -71,6 +71,7 @@ pub fn query(adapter: &str) -> Option<NvmlStats> {
 ///
 /// On a multi-GPU node with identical NVIDIA cards (e.g. 4× RTX 4090), `ordinal` selects
 /// which matching NVML handle corresponds to the `ordinal`-th DXGI adapter of that model.
+#[cfg(any(windows, test))]
 pub fn query_nth(adapter: &str, ordinal: usize) -> Option<NvmlStats> {
     let lib = Nvml::get()?;
     let device = lib.device_matching(adapter, ordinal)?;
@@ -150,6 +151,7 @@ struct Nvml {
     temperature: FnU32Arg,
     power_usage: FnU32,
     power_limit: FnU32,
+    power_mgmt_limit: Option<FnU32>,
     fan_speed: FnU32,
     clock_info: FnU32Arg,
     utilization: FnUtil,
@@ -191,6 +193,7 @@ impl Nvml {
                 temperature: symbol(lib, c"nvmlDeviceGetTemperature")?,
                 power_usage: symbol(lib, c"nvmlDeviceGetPowerUsage")?,
                 power_limit: symbol(lib, c"nvmlDeviceGetEnforcedPowerLimit")?,
+                power_mgmt_limit: symbol(lib, c"nvmlDeviceGetPowerManagementLimit"),
                 fan_speed: symbol(lib, c"nvmlDeviceGetFanSpeed")?,
                 clock_info: symbol(lib, c"nvmlDeviceGetClockInfo")?,
                 utilization: symbol(lib, c"nvmlDeviceGetUtilizationRates")?,
@@ -217,6 +220,10 @@ impl Nvml {
             out.power_w = Some(value as f32 / 1000.0);
         }
         if unsafe { (self.power_limit)(device, &mut value) } == NVML_SUCCESS {
+            out.power_limit_w = Some(value as f32 / 1000.0);
+        } else if let Some(mgmt_fn) = self.power_mgmt_limit
+            && unsafe { mgmt_fn(device, &mut value) } == NVML_SUCCESS
+        {
             out.power_limit_w = Some(value as f32 / 1000.0);
         }
         if unsafe { (self.fan_speed)(device, &mut value) } == NVML_SUCCESS {
@@ -247,6 +254,7 @@ impl Nvml {
     /// The `ordinal`-th device whose NVML name matches `adapter`, comparing on the model
     /// rather than on the exact string: DXGI and NVML agree on "NVIDIA GeForce RTX 3080 Ti"
     /// today, and a vendor prefix or a trailing revision is not worth losing the match over.
+    #[cfg(any(windows, test))]
     fn device_matching(&self, adapter: &str, ordinal: usize) -> Option<Device> {
         let mut count: c_uint = 0;
         // SAFETY: `count` is a valid local; the call reports failure through its return code.
@@ -300,6 +308,7 @@ fn c_str(buf: &[u8]) -> String {
 }
 
 /// Lowercased and stripped of the vendor prefix, so DXGI's and NVML's spellings meet.
+#[cfg(any(windows, test))]
 fn normalise(name: &str) -> String {
     name.to_ascii_lowercase()
         .trim_start_matches("nvidia")
@@ -352,13 +361,21 @@ mod platform {
     /// Loads `libnvidia-ml.so.1` (or `libnvidia-ml.so`) on Linux/Unix without linking against it.
     pub fn load_library() -> Option<Handle> {
         let flags = libc::RTLD_LAZY | libc::RTLD_LOCAL;
-        // SAFETY: static NUL-terminated library names; returns null when absent.
-        let h = unsafe { libc::dlopen(c"libnvidia-ml.so.1".as_ptr(), flags) };
-        if !h.is_null() {
-            return Some(h);
+        const CANDIDATES: &[&CStr] = &[
+            c"libnvidia-ml.so.1",
+            c"/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1",
+            c"/usr/lib64/libnvidia-ml.so.1",
+            c"/usr/local/nvidia/lib64/libnvidia-ml.so.1",
+            c"libnvidia-ml.so",
+        ];
+        for cand in CANDIDATES {
+            // SAFETY: static NUL-terminated library names; returns null when absent.
+            let h = unsafe { libc::dlopen(cand.as_ptr(), flags) };
+            if !h.is_null() {
+                return Some(h);
+            }
         }
-        let h2 = unsafe { libc::dlopen(c"libnvidia-ml.so".as_ptr(), flags) };
-        (!h2.is_null()).then_some(h2)
+        None
     }
 
     /// Resolves one entry point via `dlsym`.

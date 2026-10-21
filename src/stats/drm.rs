@@ -18,6 +18,7 @@ use super::GpuStats;
 /// Card index range to probe. Eight covers every realistic multi-GPU desktop.
 const MAX_CARDS: u32 = 8;
 
+#[cfg(test)]
 pub(super) fn query() -> Option<GpuStats> {
     (0..MAX_CARDS).find_map(card)
 }

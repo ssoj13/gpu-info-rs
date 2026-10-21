@@ -28,8 +28,9 @@
 
 #![forbid(unsafe_code)]
 
-/// Only the platforms that still shell out use this — Windows answers through DXGI + PDH.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// Only macOS still shells out (`system_profiler` / `sysctl` / `vm_stat`);
+/// Windows answers through DXGI + PDH and Linux answers through NVML (`libnvidia-ml.so.1`) + DRM sysfs.
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 // ── Public API ───────────────────────────────────────────────────────────
@@ -71,6 +72,31 @@ pub struct GpuMemInfo {
 /// Returns `None` if no GPU information could be determined.
 pub fn query() -> Option<GpuMemInfo> {
     platform_query()
+}
+
+/// Queries memory information for all GPUs on the machine without spawning any processes
+/// on Windows (DXGI + PDH) or Linux (NVML `libnvidia-ml.so.1` + DRM sysfs).
+pub fn query_all() -> Vec<GpuMemInfo> {
+    let list: Vec<GpuMemInfo> = crate::stats::query_all()
+        .into_iter()
+        .filter_map(|st| {
+            let total = st.mem_total_bytes?;
+            (total > 0).then(|| {
+                let used = st.mem_used_bytes.unwrap_or(0);
+                GpuMemInfo {
+                    name: st.name.unwrap_or_else(|| "GPU".to_string()),
+                    dedicated_vram: total,
+                    free_vram: total.saturating_sub(used),
+                    shared_memory: st.mem_shared_bytes.unwrap_or(0),
+                    unified: st.unified,
+                }
+            })
+        })
+        .collect();
+    if !list.is_empty() {
+        return list;
+    }
+    query().into_iter().collect()
 }
 
 /// Shorthand: returns dedicated VRAM of the primary GPU in bytes, or 0.
@@ -159,47 +185,6 @@ fn sys_mem_platform() -> Option<SysMemInfo> {
     None
 }
 
-// ── Common helper: nvidia-smi ────────────────────────────────────────────
-
-/// Queries `nvidia-smi` for total, free, used VRAM and GPU name.
-///
-/// Linux only: Windows answers through DXGI + PDH without a spawn, so it no longer needs
-/// this. The `nvidia-smi` binary ships with the NVIDIA driver and is typically in `PATH`.
-///
-/// Returns `None` if `nvidia-smi` is not installed, exits with an error,
-/// or produces unparseable output.
-#[cfg(target_os = "linux")]
-fn nvidia_smi_query() -> Option<GpuMemInfo> {
-    let output = Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=memory.total,memory.free,name",
-            "--format=csv,noheader,nounits",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Output: "12288, 10783, NVIDIA GeForce RTX 3080 Ti"
-    let line = stdout.lines().next()?;
-    let mut parts = line.splitn(3, ',');
-    let total_mib: u64 = parts.next()?.trim().parse().ok()?;
-    let free_mib: u64 = parts.next()?.trim().parse().ok()?;
-    let name = parts
-        .next()
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-
-    Some(GpuMemInfo {
-        name,
-        dedicated_vram: total_mib * 1024 * 1024,
-        free_vram: free_mib * 1024 * 1024,
-        shared_memory: 0,
-        unified: false,
-    })
-}
-
 // ── Platform dispatch ────────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
@@ -248,66 +233,30 @@ fn windows_query() -> Option<GpuMemInfo> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Linux — nvidia-smi (NVIDIA) or sysfs (AMD / Intel)
+// Linux — NVML (`libnvidia-ml.so.1`) or DRM sysfs (`amdgpu` / `i915` / `xe`) via `crate::stats`
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Linux: NVML (`libnvidia-ml.so.1`) for NVIDIA GPUs + DRM sysfs for AMD/Intel GPUs,
+/// via [`crate::stats::query_all`] — zero `nvidia-smi` process spawns, selecting the
+/// adapter with the most dedicated VRAM.
 #[cfg(target_os = "linux")]
 fn linux_query() -> Option<GpuMemInfo> {
-    nvidia_smi_query().or_else(linux_amd_sysfs)
-}
-
-/// AMD / Intel: the kernel exposes VRAM stats via DRM sysfs.
-///
-/// Total: `/sys/class/drm/card{i}/device/mem_info_vram_total`
-/// Used:  `/sys/class/drm/card{i}/device/mem_info_vram_used`
-/// Free = total − used.
-#[cfg(target_os = "linux")]
-fn linux_amd_sysfs() -> Option<GpuMemInfo> {
-    for i in 0..8u32 {
-        let base = format!("/sys/class/drm/card{i}/device");
-        let vram_path = format!("{base}/mem_info_vram_total");
-        let Ok(contents) = std::fs::read_to_string(&vram_path) else {
-            continue;
-        };
-        let Ok(total) = contents.trim().parse::<u64>() else {
-            continue;
-        };
-        if total == 0 {
-            continue;
-        }
-
-        let used = read_u64(&format!("{base}/mem_info_vram_used")).unwrap_or(0);
-        let free = total.saturating_sub(used);
-
-        let name = read_first_line(&format!("{base}/label"))
-            .or_else(|| read_first_line(&format!("{base}/product_name")))
-            .unwrap_or_else(|| format!("GPU (card{i})"));
-
-        return Some(GpuMemInfo {
-            name,
-            dedicated_vram: total,
-            free_vram: free,
-            shared_memory: 0,
-            unified: false,
-        });
-    }
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn read_first_line(path: &str) -> Option<String> {
-    let s = std::fs::read_to_string(path).ok()?;
-    let line = s.lines().next()?.trim();
-    if line.is_empty() {
-        None
-    } else {
-        Some(line.to_string())
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn read_u64(path: &str) -> Option<u64> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    crate::stats::query_all()
+        .into_iter()
+        .filter_map(|st| {
+            let total = st.mem_total_bytes?;
+            (total > 0).then(|| {
+                let used = st.mem_used_bytes.unwrap_or(0);
+                GpuMemInfo {
+                    name: st.name.unwrap_or_else(|| "GPU".to_string()),
+                    dedicated_vram: total,
+                    free_vram: total.saturating_sub(used),
+                    shared_memory: st.mem_shared_bytes.unwrap_or(0),
+                    unified: st.unified,
+                }
+            })
+        })
+        .max_by_key(|g| g.dedicated_vram)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
