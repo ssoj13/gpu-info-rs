@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex};
 pub struct DiskPipelineCache {
     cache: wgpu::PipelineCache,
     file: PathBuf,
-    /// Size of the data last written, so an unchanged cache is not rewritten.
-    saved: Mutex<usize>,
+    /// Content last written: rejected seeds can be larger than a fresh driver cache.
+    saved: Mutex<Option<(usize, u64)>>,
 }
 
 impl std::fmt::Debug for DiskPipelineCache {
@@ -39,22 +39,25 @@ impl DiskPipelineCache {
         &self.cache
     }
 
-    /// Write the cache's data to its file when it grew since the last write (a new pipeline was compiled into it):
+    /// Write the cache's data when its content changed, including a smaller cache after a driver update:
     /// a sibling temporary file renamed over it, so a concurrent reader never sees half a file. A failure is logged
     /// and costs only the next process's compile.
     pub fn save(&self) {
-        let Some(data) = self.cache.get_data() else {
-            return;
-        };
+        // Serialize snapshots with writes so an older concurrent snapshot cannot overwrite
+        // a newer one. Size alone misses replacements after an incompatible seed is rejected.
         let mut saved = self
             .saved
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if data.len() <= *saved {
+        let Some(data) = self.cache.get_data() else {
+            return;
+        };
+        let current = fingerprint(&data);
+        if Some(current) == *saved {
             return;
         }
         match write_atomically(&self.file, &data) {
-            Ok(()) => *saved = data.len(),
+            Ok(()) => *saved = Some(current),
             Err(error) => log::warn!(
                 "gpu-info: pipeline cache {} not written: {error}",
                 self.file.display()
@@ -130,7 +133,7 @@ fn open_in(
     Some(DiskPipelineCache {
         cache,
         file,
-        saved: Mutex::new(data.map_or(0, |data| data.len())),
+        saved: Mutex::new(data.as_deref().map(fingerprint)),
     })
 }
 
@@ -149,6 +152,13 @@ fn cache_dir() -> Option<PathBuf> {
     }
 }
 
+fn fingerprint(data: &[u8]) -> (usize, u64) {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut hash);
+    (data.len(), hash.finish())
+}
+
 fn write_atomically(file: &Path, data: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir)?;
@@ -161,6 +171,39 @@ fn write_atomically(file: &Path, data: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fingerprint_detects_equal_size_replacements_and_shrinkage() {
+        assert_eq!(fingerprint(b"same"), fingerprint(b"same"));
+        assert_ne!(fingerprint(b"old!"), fingerprint(b"new!"));
+        assert_ne!(fingerprint(b"larger rejected seed"), fingerprint(b"new"));
+    }
+
+    /// wgpu rejects the outer header before passing bytes to the driver. A larger
+    /// rejected seed must be replaced by the actual fresh cache, even without growth.
+    #[test]
+    #[ignore = "requires a Vulkan adapter with pipeline caching"]
+    fn rejected_large_seed_is_replaced() {
+        let gpu = crate::compute_device().expect("compute device");
+        let info = gpu.adapter.get_info();
+        let dir =
+            std::env::temp_dir().join(format!("gpu-info-rejected-pcache-{}", std::process::id()));
+        let first = open_in(&gpu.device, &info, &dir).expect("Vulkan cache");
+        first.save();
+        let mut rejected = std::fs::read(&first.file).expect("fresh cache persisted");
+        rejected[0] ^= 0xff; // Invalid wgpu magic: never sent to Vulkan.
+        rejected.resize(rejected.len() + 1024 * 1024, 0);
+        std::fs::write(&first.file, &rejected).unwrap();
+        let fresh = open_in(&gpu.device, &info, &dir).expect("fallback opens");
+        let actual = fresh.cache().get_data().unwrap();
+        assert!(actual.len() < rejected.len());
+        fresh.save();
+        assert!(
+            std::fs::read(&fresh.file).unwrap() == actual,
+            "Rejected seed was not replaced by the live cache"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// A pipeline compiled through the cache is saved, and a cache reopened from the file starts with that data
     /// (what a later process gets); a second save of an unchanged cache writes nothing.
@@ -203,7 +246,7 @@ mod tests {
             modified
         );
         let reopened = open_in(&gpu.device, &info, &dir).expect("reopen");
-        assert_eq!(*reopened.saved.lock().unwrap(), written.len());
+        assert_eq!(*reopened.saved.lock().unwrap(), Some(fingerprint(&written)));
         assert!(
             reopened
                 .cache()
