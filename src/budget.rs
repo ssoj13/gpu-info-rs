@@ -40,6 +40,9 @@
 
 use thiserror::Error;
 
+mod admission;
+pub use admission::{AdmissionError, Charged, MemoryBudget, MemoryUsage, Reservation};
+
 /// Share of the free VRAM a resident path may plan on: the rest stays for the compositor, other
 /// applications and driver growth.
 pub const VRAM_SHARE: f64 = 0.66;

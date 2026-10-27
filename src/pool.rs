@@ -419,6 +419,31 @@ impl<R: Pooled> ResourcePool<R> {
         idle.slots.push(resource);
     }
 
+    /// Evict at least `bytes` of the oldest idle resources, if available.
+    /// The configured retention policy is unchanged. Concurrent returns cannot
+    /// prolong this operation beyond the initial idle count.
+    pub fn evict(&self, bytes: u64) -> u64 {
+        let attempts = self.idle().slots.len();
+        let mut freed = 0u64;
+        for _ in 0..attempts {
+            if freed >= bytes {
+                break;
+            }
+            let old = {
+                let mut idle = self.idle();
+                if idle.slots.is_empty() {
+                    break;
+                }
+                let old = idle.slots.remove(0);
+                idle.bytes -= old.bytes();
+                old
+            };
+            freed = freed.saturating_add(old.bytes());
+            drop(old);
+        }
+        freed
+    }
+
     /// Idle resources and their bytes.
     pub fn idle_count(&self) -> (usize, u64) {
         let idle = self.idle();

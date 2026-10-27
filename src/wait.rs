@@ -50,7 +50,7 @@ pub const POLL_PERIOD: Duration = Duration::from_millis(1);
 /// Why a wait failed. Every variant means the awaited work's results must not be read.
 #[derive(Debug, thiserror::Error)]
 pub enum WaitError {
-    /// [`wgpu::Device::poll`] failed (device lost).
+    /// [`wgpu::Device::poll`] reported a polling error.
     #[error("device poll failed: {0}")]
     Poll(#[from] wgpu::PollError),
     /// wgpu completed a buffer map with an error.
@@ -59,7 +59,39 @@ pub enum WaitError {
     /// wgpu dropped the completion callback without calling it (the device or buffer is gone).
     #[error("completion callback dropped without running")]
     Dropped,
+    /// Submission unwound; a recovery fence, not the failed work, establishes retirement.
+    #[error("GPU submission panicked: {0}")]
+    SubmitPanicked(String),
+    /// Submission was rejected by one of its owned error scopes.
+    #[error("GPU submission rejected: {0}")]
+    SubmitRejected(String),
+    /// Native polling unwound; this is not a retirement proof.
+    #[error("GPU polling panicked: {0}")]
+    PollPanicked(String),
+    /// The host reported terminal loss of the adopted context.
+    #[error("GPU device lost: {0}")]
+    DeviceLost(String),
 }
+
+impl Clone for WaitError {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Poll(wgpu::PollError::Timeout) => Self::Poll(wgpu::PollError::Timeout),
+            Self::Poll(wgpu::PollError::WrongSubmissionIndex(a, b)) => {
+                Self::Poll(wgpu::PollError::WrongSubmissionIndex(*a, *b))
+            }
+            Self::Map(error) => Self::Map(error.clone()),
+            Self::Dropped => Self::Dropped,
+            Self::SubmitPanicked(message) => Self::SubmitPanicked(message.clone()),
+            Self::SubmitRejected(message) => Self::SubmitRejected(message.clone()),
+            Self::PollPanicked(message) => Self::PollPanicked(message.clone()),
+            Self::DeviceLost(message) => Self::DeviceLost(message.clone()),
+        }
+    }
+}
+
+mod work;
+pub use work::{RecordedWork, WorkContext, WorkLease, WorkQueue, WorkSubmitError};
 
 /// A submission slower than this, from `submit` to its observed completion, is logged at debug level.
 pub const SLOW_SUBMISSION: Duration = Duration::from_millis(50);
@@ -109,10 +141,200 @@ fn with_stats(label: &'static str, update: impl FnOnce(&mut SubmitStats)) {
 }
 
 /// Work submitted through [`submit`]; [`wait`] blocks until it completed.
+#[derive(Clone)]
 #[must_use = "wait for it, or drop it deliberately: nothing else tells when it completed"]
 pub struct Submission {
     /// Set by the submission's completion callback.
     signal: Arc<Signal>,
+    validation: Option<Arc<Validation>>,
+}
+
+trait ValidationFuture: std::future::Future<Output = Option<wgpu::Error>> + wgpu::WasmNotSend {}
+impl<T> ValidationFuture for T where
+    T: std::future::Future<Output = Option<wgpu::Error>> + wgpu::WasmNotSend
+{
+}
+
+struct ValidationState {
+    future: Option<std::pin::Pin<Box<dyn ValidationFuture>>>,
+    outcome: Option<Result<(), WaitError>>,
+}
+
+/// Error scopes are popped on the producing thread; only their futures travel.
+enum Validation {
+    Future(Mutex<ValidationState>),
+    All(Vec<Arc<Validation>>),
+}
+
+impl Validation {
+    fn new(future: impl ValidationFuture + 'static) -> Self {
+        Self::Future(Mutex::new(ValidationState {
+            future: Some(Box::pin(future)),
+            outcome: None,
+        }))
+    }
+
+    fn poll_all(
+        validations: &[Arc<Self>],
+        cx: &mut std::task::Context<'_>,
+    ) -> Option<Result<(), WaitError>> {
+        let mut pending = false;
+        let mut failure = None;
+        for validation in validations {
+            match validation.poll(cx) {
+                None => pending = true,
+                Some(Err(error)) if failure.is_none() => failure = Some(error),
+                Some(_) => {}
+            }
+        }
+        (!pending).then(|| failure.map_or(Ok(()), Err))
+    }
+
+    fn status(&self) -> Option<Result<(), WaitError>> {
+        self.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+    }
+
+    fn poll(&self, cx: &mut std::task::Context<'_>) -> Option<Result<(), WaitError>> {
+        let mutex = match self {
+            Self::All(validations) => return Self::poll_all(validations, cx),
+            Self::Future(mutex) => mutex,
+        };
+        let mut future = {
+            let mut state = mutex.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(outcome) = &state.outcome {
+                return Some(outcome.clone());
+            }
+            state.future.take()?
+        };
+        // Poll and destroy backend futures outside the metadata mutex.
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(cx)));
+        let outcome = match result {
+            Ok(std::task::Poll::Ready(error)) => Some(error.map_or(Ok(()), |error| {
+                Err(WaitError::SubmitRejected(error.to_string()))
+            })),
+            Ok(std::task::Poll::Pending) => None,
+            Err(payload) => Some(Err(WaitError::SubmitRejected(format!(
+                "error-scope polling panicked: {}",
+                panic_message(payload.as_ref())
+            )))),
+        };
+        let mut state = mutex.lock().unwrap_or_else(PoisonError::into_inner);
+        state.outcome = outcome.clone();
+        if outcome.is_none() {
+            state.future = Some(future);
+        }
+        outcome
+    }
+}
+
+/// A resource operation whose result remains private until all owned error scopes settle.
+/// No GPU submission or completion wait is performed by this owner.
+#[must_use = "poll or resolve the checked operation before using its result"]
+pub struct Checked<T> {
+    value: Option<Result<T, WaitError>>,
+    validation: Arc<Validation>,
+}
+
+impl<T> std::fmt::Debug for Checked<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Checked")
+            .field("has_result", &self.value.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> Checked<T> {
+    /// Inspect validation without blocking. Pending retains both result and futures.
+    /// Ready consumes the result; subsequent polls return Dropped.
+    pub fn poll(&mut self) -> std::task::Poll<Result<T, WaitError>> {
+        self.poll_with(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+    }
+
+    fn poll_with(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<T, WaitError>> {
+        if self.value.is_none() {
+            return std::task::Poll::Ready(Err(WaitError::Dropped));
+        }
+        let Some(validation) = self.validation.poll(cx) else {
+            return std::task::Poll::Pending;
+        };
+        let value = self.value.take().unwrap_or(Err(WaitError::Dropped));
+        std::task::Poll::Ready(validation.and(value))
+    }
+
+    /// Await validation while retaining the operation result and every scope future.
+    pub async fn resolve(mut self) -> Result<T, WaitError> {
+        std::future::poll_fn(|cx| self.poll_with(cx)).await
+    }
+}
+
+/// Run one resource/recording operation under validation, OOM and internal scopes.
+/// Scopes pop on this thread even if the operation panics; Pending is an owned result,
+/// never proof that the operation succeeded. Use RecordedWork::record for GPU commands.
+pub fn checked<T>(device: &wgpu::Device, operation: impl FnOnce() -> T) -> Checked<T> {
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
+        .map_err(|payload| WaitError::SubmitPanicked(panic_message(payload.as_ref())));
+    let internal = internal.pop();
+    let memory = memory.pop();
+    let validation = validation.pop();
+    Checked {
+        value: Some(value),
+        validation: Arc::new(Validation::new(async move {
+            let internal = internal.await;
+            let memory = memory.await;
+            let validation = validation.await;
+            internal.or(memory).or(validation)
+        })),
+    }
+}
+
+fn outcome(signal: &Signal, validation: Option<&Validation>) -> Option<Result<(), WaitError>> {
+    if let Some(validation) = validation {
+        match validation.status()? {
+            Ok(()) => {}
+            Err(error) => return Some(Err(error)),
+        }
+    }
+    signal
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+impl Submission {
+    /// The observed outcome without GPU polling, waiting or consuming it.
+    /// Owned WorkQueue submissions also poll their CPU error-scope futures here.
+    /// Plain submit reports retirement only: its caller must still check host error scopes.
+    /// A failure does not itself prove retirement; WorkQueue retains failed leases until proof.
+    pub fn status(&self) -> Option<Result<(), WaitError>> {
+        outcome(&self.signal, self.validation.as_deref())
+    }
+
+    fn pending() -> Self {
+        Self {
+            signal: Arc::default(),
+            validation: None,
+        }
+    }
+
+    /// Whether owned submission error scopes have accepted its commands.
+    ///
+    /// `Some(Ok(()))` permits dependent work; it does not prove GPU retirement.
+    /// `None` means validation is pending, or this came from plain [`submit`]
+    /// without owned error scopes. Inspect [`Self::status`] for completion.
+    pub fn validation_status(&self) -> Option<Result<(), WaitError>> {
+        self.validation
+            .as_ref()
+            .and_then(|validation| validation.status())
+    }
 }
 
 /// Submit `commands` on `queue` as `label` (what the work is, for [`submit_stats`]) and register the
@@ -121,9 +343,20 @@ pub fn submit<I>(queue: &wgpu::Queue, label: &'static str, commands: I) -> Submi
 where
     I: IntoIterator<Item = wgpu::CommandBuffer>,
 {
+    submit_to(queue, label, commands, Arc::default())
+}
+
+fn submit_to<I>(
+    queue: &wgpu::Queue,
+    label: &'static str,
+    commands: I,
+    signal: Arc<Signal>,
+) -> Submission
+where
+    I: IntoIterator<Item = wgpu::CommandBuffer>,
+{
     /// Keeps another [`submit`] from landing between a submission and its callback.
     static BIND: Mutex<()> = Mutex::new(());
-    let signal: Arc<Signal> = Arc::default();
     with_stats(label, |entry| {
         entry.count += 1;
         entry.in_flight += 1;
@@ -138,16 +371,23 @@ where
         reason = "the one submit of the cluster: its completion callback is registered below"
     )]
     queue.submit(commands);
+    #[cfg(test)]
+    if PANIC_AFTER_SUBMIT.take() {
+        panic!("injected panic after actual queue submission");
+    }
     queue.on_submitted_work_done(move || {
         let mut notify = notify;
         notify.finish(Ok(()));
     });
-    Submission { signal }
+    Submission {
+        signal,
+        validation: None,
+    }
 }
 
 /// Block the calling thread until `submission` completed (see the module docs: no blocking poll).
 pub fn wait(device: &wgpu::Device, submission: &Submission) -> Result<(), WaitError> {
-    block(device, &submission.signal)
+    block(device, &submission.signal, submission.validation.as_deref())
 }
 
 /// [`wait`] for everything submitted to `queue` so far (an empty submission marks it): for a caller
@@ -170,7 +410,7 @@ pub fn map_read(device: &wgpu::Device, slice: &wgpu::BufferSlice<'_>) -> Result<
         let mut notify = notify;
         notify.finish(result.map_err(WaitError::Map));
     });
-    block(device, &signal)
+    block(device, &signal, None)
 }
 
 /// Drive a wgpu future (an error-scope pop, an adapter request) to completion on the calling
@@ -224,24 +464,20 @@ impl Drop for Notify {
 }
 
 /// Poll `device` without blocking until `signal` holds an outcome, sleeping on its condition
-/// variable for at most [`POLL_PERIOD`] between polls, then take the outcome.
-fn block(device: &wgpu::Device, signal: &Signal) -> Result<(), WaitError> {
+/// variable for at most [`POLL_PERIOD`] between polls; observers retain the outcome.
+fn block(
+    device: &wgpu::Device,
+    signal: &Signal,
+    validation: Option<&Validation>,
+) -> Result<(), WaitError> {
     let (outcome, changed) = signal;
     loop {
-        if let Some(result) = outcome
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
+        if let Some(result) = self::outcome(signal, validation) {
             return result;
         }
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "PollType::Poll never blocks and has no index to assert on (module docs)"
-        )]
-        device.poll(wgpu::PollType::Poll)?;
+        poll(device)?;
         let guard = outcome.lock().unwrap_or_else(PoisonError::into_inner);
-        if guard.is_none() {
+        if guard.is_none() || validation.is_some() {
             let _slept = changed
                 .wait_timeout(guard, POLL_PERIOD)
                 .unwrap_or_else(PoisonError::into_inner);
@@ -249,10 +485,64 @@ fn block(device: &wgpu::Device, signal: &Signal) -> Result<(), WaitError> {
     }
 }
 
+fn submit_checked<I>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &'static str,
+    commands: I,
+    signal: Arc<Signal>,
+) -> Checked<Submission>
+where
+    I: IntoIterator<Item = wgpu::CommandBuffer>,
+{
+    checked(device, || submit_to(queue, label, commands, signal))
+}
+
+#[cfg(test)]
+thread_local! {
+    static PANIC_AFTER_SUBMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PANIC_ON_POLL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn poll(device: &wgpu::Device) -> Result<wgpu::PollStatus, WaitError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(test)]
+        if PANIC_ON_POLL.take() {
+            panic!("injected fatal device poll");
+        }
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "PollType::Poll never blocks and has no index to assert on (module docs)"
+        )]
+        device.poll(wgpu::PollType::Poll)
+    }))
+    .map_err(|payload| WaitError::PollPanicked(panic_message(payload.as_ref())))?
+    .map_err(WaitError::Poll)
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else {
+        "non-string panic payload".to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn unscoped_submission_does_not_claim_validation() {
+        let submission = Submission::pending();
+        assert!(submission.validation_status().is_none());
+        *submission.signal.0.lock().expect("signal") = Some(Ok(()));
+        assert!(matches!(submission.status(), Some(Ok(()))));
+        assert!(submission.validation_status().is_none());
+    }
 
     /// A callback wgpu drops without calling (device loss) wakes the waiter with `Dropped`
     /// instead of blocking it forever.

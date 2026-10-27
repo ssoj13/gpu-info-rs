@@ -48,6 +48,10 @@ mod pin;
 pub mod pipeline_cache;
 #[cfg(feature = "wgpu")]
 pub use pipeline_cache::{DiskPipelineCache, create_compute_pipeline, pipeline_cache};
+/// The compute device's Vulkan opening (ofx-rs VK1): `VK_NV_optical_flow` and one optical-flow queue when the adapter
+/// reports them, and the device's raw handles ([`ComputeGpu::optical_flow`], [`ComputeGpu::raw`]).
+#[cfg(feature = "wgpu")]
+pub mod compute_vk;
 /// The shared device as raw Vulkan: video extensions, a decode queue, and the `ash` handles a
 /// hardware decoder needs to run on the SAME device wgpu computes on.
 ///
@@ -76,17 +80,18 @@ pub mod shared_vk;
 ))]
 #[path = "shared_vk_unavailable.rs"]
 pub mod shared_vk;
-/// The compute device's Vulkan opening (ofx-rs VK1): `VK_NV_optical_flow` and one optical-flow queue when the adapter
-/// reports them, and the device's raw handles ([`ComputeGpu::optical_flow`], [`ComputeGpu::raw`]).
-#[cfg(feature = "wgpu")]
-pub mod compute_vk;
-#[cfg(all(
-    feature = "wgpu",
-    any(windows, target_os = "linux", target_os = "android", target_os = "freebsd")
-))]
-pub use compute_vk::{VulkanHandles, optical_flow_family, wants_optical_flow};
 #[cfg(feature = "wgpu")]
 pub use compute_vk::OpticalFlow;
+#[cfg(all(
+    feature = "wgpu",
+    any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd"
+    )
+))]
+pub use compute_vk::{VulkanHandles, optical_flow_family, wants_optical_flow};
 #[cfg(feature = "wgpu")]
 mod vram;
 /// The one submit-and-wait of the cluster: [`submit`] + [`wait`](fn@wait) / [`wait_idle`] and [`map_read`],
@@ -98,9 +103,16 @@ pub mod wait;
 /// Reused GPU resources: bounded per-device pools of buffers and textures (`pool`). The pool
 /// and the `Gate` are wgpu-free; the buffer and texture keys and their pools need `wgpu`.
 pub mod pool;
+/// Context-local charged allocations, whole-operation admission and reusable staging.
+#[cfg(feature = "wgpu")]
+pub mod resources;
 #[cfg(feature = "wgpu")]
 pub use pool::{BufferKey, BufferWorkspace, BufferWorkspaceError, COMPUTE_BUFFERS, TextureKey};
 pub use pool::{Gate, OwnedPermit, Permit, Pooled, ResourcePool};
+#[cfg(feature = "wgpu")]
+pub use resources::{
+    Batch, Buffer, BufferSpec, Prepared, ResourceError, Resources, Spec, Texture, TextureSpec,
+};
 /// Windows RAM via `GlobalMemoryStatusEx` (a syscall, not a `wmic` process spawn) — see [`win_mem`].
 #[cfg(windows)]
 mod win_mem;
@@ -145,7 +157,8 @@ pub use vram::{
 };
 #[cfg(feature = "wgpu")]
 pub use wait::{
-    POLL_PERIOD, SLOW_SUBMISSION, Submission, SubmitStats, WaitError, block_on, map_read, submit,
+    Checked, POLL_PERIOD, RecordedWork, SLOW_SUBMISSION, Submission, SubmitStats, WaitError,
+    WorkContext, WorkLease, WorkQueue, WorkSubmitError, block_on, checked, map_read, submit,
     submit_stats, wait, wait_idle,
 };
 
@@ -541,9 +554,15 @@ fn open_compute_device(
     instance: wgpu::Instance,
     features: wgpu::Features,
 ) -> Result<ComputeGpu, String> {
-    #[cfg(any(windows, target_os = "linux", target_os = "android", target_os = "freebsd"))]
+    #[cfg(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd"
+    ))]
     {
-        let (device, queue, optical_flow, raw) = compute_vk::open_compute(&adapter, features, &adapter.limits())?;
+        let (device, queue, optical_flow, raw) =
+            compute_vk::open_compute(&adapter, features, &adapter.limits())?;
         Ok(ComputeGpu {
             device,
             queue,
@@ -553,11 +572,20 @@ fn open_compute_device(
             raw,
         })
     }
-    #[cfg(not(any(windows, target_os = "linux", target_os = "android", target_os = "freebsd")))]
+    #[cfg(not(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd"
+    )))]
     {
-        let (device, queue) = pollster::block_on(request_max_device(&adapter, features)).map_err(|error| {
-            format!("cannot create compute device on {}: {error}", adapter.get_info().name)
-        })?;
+        let (device, queue) =
+            pollster::block_on(request_max_device(&adapter, features)).map_err(|error| {
+                format!(
+                    "cannot create compute device on {}: {error}",
+                    adapter.get_info().name
+                )
+            })?;
         Ok(ComputeGpu {
             device,
             queue,
@@ -627,7 +655,12 @@ pub struct ComputeGpu {
     pub optical_flow: Option<OpticalFlow>,
     /// The device's raw Vulkan handles, read once at opening ([`compute_vk::VulkanHandles`]); `None` on a DX12 device.
     /// Consumers take them here instead of calling `as_hal` (ofx-motion `vk_nv`, the vfx-compute Vulkan executor).
-    #[cfg(any(windows, target_os = "linux", target_os = "android", target_os = "freebsd"))]
+    #[cfg(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd"
+    ))]
     pub raw: Option<VulkanHandles>,
 }
 

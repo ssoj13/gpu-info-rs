@@ -218,7 +218,7 @@ impl Adapter {
         if list.iter().any(|a| !a.unified) {
             list.retain(|a| !a.unified);
         }
-        list.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes));
+        list.sort_by_key(|a| std::cmp::Reverse(a.total_bytes));
         list
     }
 }
