@@ -366,7 +366,7 @@ where
         timed: Some((label, Instant::now())),
     };
     let _bind = BIND.lock().unwrap_or_else(PoisonError::into_inner);
-    #[allow(
+    #[expect(
         clippy::disallowed_methods,
         reason = "the one submit of the cluster: its completion callback is registered below"
     )]
@@ -510,7 +510,7 @@ fn poll(device: &wgpu::Device) -> Result<wgpu::PollStatus, WaitError> {
         if PANIC_ON_POLL.take() {
             panic!("injected fatal device poll");
         }
-        #[allow(
+        #[expect(
             clippy::disallowed_methods,
             reason = "PollType::Poll never blocks and has no index to assert on (module docs)"
         )]

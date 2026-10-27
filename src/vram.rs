@@ -309,12 +309,16 @@ pub fn vram_budget_from_context(ctx: GpuVramContext<'_>) -> Option<u64> {
 pub fn vram_budget_bytes(adapter: &wgpu::Adapter) -> Option<u64> {
     #[cfg(windows)]
     {
-        return imp::vram_budget_adapter(adapter);
+        imp::vram_budget_adapter(adapter)
     }
 
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
-    if adapter.get_info().backend == wgpu::Backend::Vulkan {
-        return imp::vram_budget_adapter(adapter);
+    {
+        if adapter.get_info().backend == wgpu::Backend::Vulkan {
+            imp::vram_budget_adapter(adapter)
+        } else {
+            None
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -323,7 +327,7 @@ pub fn vram_budget_bytes(adapter: &wgpu::Adapter) -> Option<u64> {
         log::debug!(
             "vram_budget_bytes: macOS Metal requires a wgpu Device; use vram_budget_from_context"
         );
-        return None;
+        None
     }
 
     #[cfg(not(any(
@@ -333,12 +337,6 @@ pub fn vram_budget_bytes(adapter: &wgpu::Adapter) -> Option<u64> {
         target_os = "freebsd",
         target_os = "macos"
     )))]
-    {
-        let _ = adapter;
-        return None;
-    }
-
-    #[allow(unreachable_code)]
     {
         let _ = adapter;
         None
