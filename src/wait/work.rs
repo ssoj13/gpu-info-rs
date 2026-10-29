@@ -344,6 +344,11 @@ impl WorkQueue {
         self.pending.len()
     }
 
+    /// Maximum number of retained submissions before [`Self::try_submit`] reports `Busy`.
+    pub fn capacity(&self) -> NonZeroUsize {
+        self.capacity
+    }
+
     /// Whether a failed submission still needs a retirement proof.
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
@@ -525,6 +530,56 @@ impl WorkQueue {
         }
         self.poisoned = self.pending.iter().any(|entry| entry.failure.is_some());
         failure.map_or(Ok(completed), Err)
+    }
+
+    /// Poll and wait up to `timeout` until at least `needed` submission slots are available.
+    ///
+    /// `needed` is clamped to `1..=self.capacity().get()`. Returns the total number of
+    /// submissions retired during this call, or returns early once `timeout` elapses or
+    /// the queue becomes poisoned.
+    pub fn wait_for_slots(
+        &mut self,
+        needed: usize,
+        timeout: std::time::Duration,
+    ) -> Result<usize, WaitError> {
+        let needed = needed.clamp(1, self.capacity.get());
+        let max_pending = self.capacity.get() - needed;
+        let mut total_completed = self.collect()?;
+        if self.pending.len() <= max_pending || self.poisoned || timeout.is_zero() {
+            return Ok(total_completed);
+        }
+        let start = std::time::Instant::now();
+        let deadline = start.checked_add(timeout);
+        loop {
+            if self.pending.len() <= max_pending || self.poisoned {
+                break;
+            }
+            let now = std::time::Instant::now();
+            let remaining = match deadline {
+                Some(deadline) => {
+                    if now >= deadline {
+                        break;
+                    }
+                    deadline - now
+                }
+                None => timeout.saturating_sub(now.saturating_duration_since(start)),
+            };
+            if remaining.is_zero() {
+                break;
+            }
+            let slice = remaining.min(POLL_PERIOD);
+            if let Some(entry) = self.pending.first() {
+                let (state, changed) = &*entry.completion.signal;
+                let guard = state.lock().unwrap_or_else(PoisonError::into_inner);
+                if guard.is_none() {
+                    let _slept = changed
+                        .wait_timeout(guard, slice)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+            }
+            total_completed += self.collect()?;
+        }
+        Ok(total_completed)
     }
 
     /// Wait for and settle all retained work on a worker/teardown thread.

@@ -590,3 +590,73 @@ fn recording_rejection_aborts_before_submission() {
         [Event::Aborted(1), Event::Dropped(1)]
     );
 }
+
+#[test]
+fn capacity_and_wait_for_slots_zero_timeout_on_empty_and_populated_queue() {
+    use std::time::Duration;
+
+    let gpu = crate::shared_device().expect("shared GPU");
+    let context = WorkContext::new(&gpu.device, &gpu.queue);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut queue = WorkQueue::new(&context, NonZeroUsize::new(2).unwrap());
+
+    assert_eq!(queue.capacity().get(), 2);
+    assert_eq!(queue.wait_for_slots(1, Duration::ZERO).unwrap(), 0);
+    assert_eq!(queue.wait_for_slots(0, Duration::ZERO).unwrap(), 0);
+    assert_eq!(queue.wait_for_slots(99, Duration::ZERO).unwrap(), 0);
+
+    let signal1: Arc<Signal> = Arc::default();
+    let signal2: Arc<Signal> = Arc::default();
+    queue.pending.push(PendingWork {
+        completion: Submission {
+            signal: Arc::clone(&signal1),
+            validation: None,
+        },
+        leases: vec![Box::new(lease(1, &events))],
+        failure: None,
+        recovery: None,
+        committed: true,
+    });
+    queue.pending.push(PendingWork {
+        completion: Submission {
+            signal: Arc::clone(&signal2),
+            validation: None,
+        },
+        leases: vec![Box::new(lease(2, &events))],
+        failure: None,
+        recovery: None,
+        committed: true,
+    });
+    assert_eq!(queue.pending(), 2);
+
+    // Full queue with unresolved signals returns immediately on zero timeout.
+    assert_eq!(queue.wait_for_slots(1, Duration::ZERO).unwrap(), 0);
+    assert_eq!(queue.pending(), 2);
+
+    // Retiring one entry frees one slot on the next zero-timeout wait_for_slots call.
+    let mut notify1 = Notify {
+        signal: signal1,
+        timed: None,
+    };
+    notify1.finish(Ok(()));
+    assert_eq!(queue.wait_for_slots(1, Duration::ZERO).unwrap(), 1);
+    assert_eq!(queue.pending(), 1);
+
+    // Clean up the remaining synthetic entry before WorkQueue::drop.
+    let mut notify2 = Notify {
+        signal: signal2,
+        timed: None,
+    };
+    notify2.finish(Ok(()));
+    assert_eq!(queue.wait_for_slots(2, Duration::ZERO).unwrap(), 1);
+    assert_eq!(queue.pending(), 0);
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            Event::Completed(1, true),
+            Event::Dropped(1),
+            Event::Completed(2, true),
+            Event::Dropped(2)
+        ]
+    );
+}
