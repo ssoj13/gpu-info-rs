@@ -276,6 +276,29 @@ struct PendingWork {
 }
 
 impl PendingWork {
+    /// The submission whose completion signal is currently awaited for retirement (`recovery`
+    /// once a failed submission has queued a recovery fence, otherwise `completion`).
+    fn active_submission(&self) -> &Submission {
+        self.recovery.as_ref().unwrap_or(&self.completion)
+    }
+
+    /// Poll both original and recovery validation scopes without short-circuiting and report
+    /// whether all owned validation scopes have settled.
+    fn validations_settled(&self) -> bool {
+        let completion_settled = self
+            .completion
+            .validation
+            .as_ref()
+            .is_none_or(|validation| validation.status().is_some());
+        let recovery_settled = self.recovery.as_ref().is_none_or(|recovery| {
+            recovery
+                .validation
+                .as_ref()
+                .is_none_or(|validation| validation.status().is_some())
+        });
+        completion_settled && recovery_settled
+    }
+
     fn submitted(&mut self) {
         self.committed = true;
         for lease in &mut self.leases {
@@ -491,19 +514,7 @@ impl WorkQueue {
 
             let entry = &self.pending[index];
             let outcome = if let Some(error) = &entry.failure {
-                let validation_settled = entry
-                    .completion
-                    .validation
-                    .as_ref()
-                    .is_none_or(|validation| validation.status().is_some());
-                let recovery_settled = entry.recovery.as_ref().is_none_or(|recovery| {
-                    recovery
-                        .validation
-                        .as_ref()
-                        .is_none_or(|validation| validation.status().is_some())
-                });
-                if validation_settled
-                    && recovery_settled
+                if entry.validations_settled()
                     && (queue_empty
                         || entry
                             .recovery
@@ -521,7 +532,9 @@ impl WorkQueue {
                 if let Err(error) = &outcome {
                     failure.get_or_insert_with(|| error.clone());
                 }
-                let entry = self.pending.swap_remove(index);
+                // Preserve strict FIFO submission order so `self.pending.first()` is always
+                // the oldest in-flight GPU submission for `wait_for_slots` and `pause`.
+                let entry = self.pending.remove(index);
                 entry.finish(outcome);
                 completed += 1;
             } else {
@@ -537,6 +550,11 @@ impl WorkQueue {
     /// `needed` is clamped to `1..=self.capacity().get()`. Returns the total number of
     /// submissions retired during this call, or returns early once `timeout` elapses or
     /// the queue becomes poisoned.
+    ///
+    /// Each wait slice is bounded by [`POLL_PERIOD`] (1 ms) with the signal mutex dropped
+    /// before `self.collect()` calls `device.poll(wgpu::PollType::Poll)`, ensuring that
+    /// `wgpu::Queue::on_submitted_work_done` callbacks are driven even when the host GUI
+    /// thread is parked by event-driven `GuiWaker`.
     pub fn wait_for_slots(
         &mut self,
         needed: usize,
@@ -568,15 +586,7 @@ impl WorkQueue {
                 break;
             }
             let slice = remaining.min(POLL_PERIOD);
-            if let Some(entry) = self.pending.first() {
-                let (state, changed) = &*entry.completion.signal;
-                let guard = state.lock().unwrap_or_else(PoisonError::into_inner);
-                if guard.is_none() {
-                    let _slept = changed
-                        .wait_timeout(guard, slice)
-                        .unwrap_or_else(PoisonError::into_inner);
-                }
-            }
+            self.wait_slice(slice);
             total_completed += self.collect()?;
         }
         Ok(total_completed)
@@ -642,14 +652,28 @@ impl WorkQueue {
         Some(error)
     }
 
-    fn pause(&self) {
+    /// Wait up to `slice` on the oldest in-flight submission's condition variable.
+    ///
+    /// Invariant: validation futures are polled before locking the signal mutex (avoiding
+    /// nested lock order between `Validation` and `Signal`), and the signal mutex guard is
+    /// dropped before returning so the subsequent `self.collect()` -> `device.poll(PollType::Poll)`
+    /// call can never deadlock when `wgpu` fires `on_submitted_work_done` synchronously.
+    fn wait_slice(&self, slice: std::time::Duration) {
         if let Some(entry) = self.pending.first() {
-            let (state, changed) = &*entry.completion.signal;
+            let validations_settled = entry.validations_settled();
+            let active = entry.active_submission();
+            let (state, changed) = &*active.signal;
             let guard = state.lock().unwrap_or_else(PoisonError::into_inner);
-            let _slept = changed
-                .wait_timeout(guard, POLL_PERIOD)
-                .unwrap_or_else(PoisonError::into_inner);
+            if guard.is_none() || !validations_settled || entry.failure.is_some() {
+                let _slept = changed
+                    .wait_timeout(guard, slice)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
         }
+    }
+
+    fn pause(&self) {
+        self.wait_slice(POLL_PERIOD);
     }
 }
 
@@ -675,3 +699,124 @@ impl Drop for WorkQueue {
 #[cfg(test)]
 #[path = "work_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod slot_wait_tests {
+    use super::*;
+    use crate::wait::{Notify, Signal};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn active_submission_and_validations_settled_track_recovery_and_scopes() {
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&ready);
+        let mut completion = Submission::pending();
+        completion.validation = Some(Arc::new(Validation::new(std::future::poll_fn(move |_| {
+            if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                std::task::Poll::Ready(None)
+            } else {
+                std::task::Poll::Pending
+            }
+        }))));
+
+        let recovery = Submission::pending();
+        let recovery_signal = Arc::clone(&recovery.signal);
+        let mut entry = PendingWork {
+            completion,
+            leases: Vec::new(),
+            failure: None,
+            recovery: None,
+            committed: true,
+        };
+
+        assert!(!entry.validations_settled());
+        assert!(!Arc::ptr_eq(&entry.active_submission().signal, &recovery_signal));
+
+        entry.recovery = Some(recovery);
+        assert!(Arc::ptr_eq(&entry.active_submission().signal, &recovery_signal));
+        assert!(!entry.validations_settled());
+
+        ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(entry.validations_settled());
+    }
+
+    #[test]
+    fn collect_preserves_fifo_order_and_wait_for_slots_exercises_nonzero_timeout() {
+        let Some(gpu) = crate::shared_device() else {
+            return;
+        };
+        let context = WorkContext::new(&gpu.device, &gpu.queue);
+        let mut queue = WorkQueue::new(&context, NonZeroUsize::new(3).unwrap());
+
+        let signal1: Arc<Signal> = Arc::default();
+        let signal2: Arc<Signal> = Arc::default();
+        let signal3: Arc<Signal> = Arc::default();
+        for signal in [&signal1, &signal2, &signal3] {
+            queue.pending.push(PendingWork {
+                completion: Submission {
+                    signal: Arc::clone(signal),
+                    validation: None,
+                },
+                leases: vec![Box::new(())],
+                failure: None,
+                recovery: None,
+                committed: true,
+            });
+        }
+
+        // Retiring the oldest entry (index 0) must keep [signal2, signal3] in FIFO order,
+        // never [signal3, signal2] as `swap_remove(0)` did.
+        Notify {
+            signal: Arc::clone(&signal1),
+            timed: None,
+        }
+        .finish(Ok(()));
+        assert_eq!(queue.wait_for_slots(1, Duration::ZERO).unwrap(), 1);
+        assert_eq!(queue.pending(), 2);
+        assert!(
+            Arc::ptr_eq(&queue.pending[0].completion.signal, &signal2),
+            "pending[0] must remain the oldest unresolved submission (signal2)"
+        );
+
+        // Non-zero timeout expires cleanly when 2 free slots are requested (`max_pending = 1`)
+        // and `signal2` has not completed yet.
+        assert_eq!(
+            queue
+                .wait_for_slots(2, Duration::from_millis(3))
+                .unwrap(),
+            0
+        );
+        assert_eq!(queue.pending(), 2);
+
+        // When `signal2` (the oldest remaining submission) is notified on a worker thread,
+        // `wait_for_slots(2, ...)` wakes on `pending[0]` (`signal2`) well before the 500 ms timeout.
+        let signal2_worker = Arc::clone(&signal2);
+        let notifier = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            Notify {
+                signal: signal2_worker,
+                timed: None,
+            }
+            .finish(Ok(()));
+        });
+        let started = Instant::now();
+        assert_eq!(
+            queue
+                .wait_for_slots(2, Duration::from_millis(500))
+                .unwrap(),
+            1
+        );
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(queue.pending(), 1);
+        notifier.join().unwrap();
+
+        // Retire `signal3` before drop.
+        Notify {
+            signal: signal3,
+            timed: None,
+        }
+        .finish(Ok(()));
+        assert_eq!(queue.wait_for_slots(3, Duration::ZERO).unwrap(), 1);
+        assert_eq!(queue.pending(), 0);
+    }
+}
