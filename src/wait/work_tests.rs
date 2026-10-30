@@ -297,6 +297,39 @@ fn failed_callback_settles_as_failure_and_never_as_abort_or_reusable_success() {
     );
 }
 
+#[test]
+#[ignore = "requires GPU"]
+fn validated_submission_recovers_from_surface_configure_dropped_callback_once_retired() {
+    let gpu = crate::shared_device().expect("shared GPU");
+    let context = WorkContext::new(&gpu.device, &gpu.queue);
+    wait_idle(&gpu.device, &gpu.queue).unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut observer = Submission::pending();
+    observer.validation = Some(Arc::new(crate::wait::Validation::new(std::future::ready(
+        None,
+    ))));
+    queue_failed_callback(&observer);
+    let mut queue = owner(&context);
+    queue.pending.push(PendingWork {
+        completion: observer,
+        leases: vec![Box::new(lease(1, &events))],
+        failure: None,
+        recovery: None,
+        committed: false,
+    });
+    assert_eq!(queue.collect().unwrap(), 1);
+    assert!(!queue.is_poisoned());
+    assert_eq!(queue.pending(), 0);
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            Event::Submitted(1),
+            Event::Completed(1, true),
+            Event::Dropped(1)
+        ]
+    );
+}
+
 fn queue_failed_callback(observer: &Submission) {
     drop(Notify {
         signal: Arc::clone(&observer.signal),

@@ -512,15 +512,37 @@ impl WorkQueue {
                 }
             }
 
-            let entry = &self.pending[index];
-            let outcome = if let Some(error) = &entry.failure {
-                if entry.validations_settled()
+            let (retired, recovered_dropped_callback) = {
+                let entry = &self.pending[index];
+                let retired = entry.validations_settled()
                     && (queue_empty
                         || entry
                             .recovery
                             .as_ref()
-                            .is_some_and(|recovery| matches!(recovery.status(), Some(Ok(())))))
-                {
+                            .is_some_and(|recovery| matches!(recovery.status(), Some(Ok(())))));
+                let recovered = retired
+                    && matches!(entry.failure, Some(WaitError::Dropped))
+                    && self.context.loss_reason().is_none()
+                    && entry.completion.validation.is_some()
+                    && matches!(entry.completion.validation_status(), Some(Ok(())));
+                (retired, recovered)
+            };
+            if recovered_dropped_callback && !self.pending[index].committed {
+                self.pending[index].submitted();
+            }
+            let entry = &self.pending[index];
+            let outcome = if let Some(error) = &entry.failure {
+                if recovered_dropped_callback {
+                    // wgpu-core 30 `Device::configure_surface` (`resource.rs`) calls
+                    // `self.maintain(PollType::wait_indefinitely(), ...)` and breaks early with
+                    // `GpuWaitTimeout` before calling `user_callbacks.fire()` whenever another
+                    // thread submits work concurrently during window resize, dropping completed
+                    // `on_submitted_work_done` callbacks without invoking them. When the device
+                    // is not lost, all owned validation scopes succeeded, and in-order queue
+                    // retirement is proved (`queue_empty` or a subsequent recovery fence), the
+                    // submission retired cleanly and must not poison the queue.
+                    Some(Ok(()))
+                } else if retired {
                     Some(Err(error.clone()))
                 } else {
                     None
