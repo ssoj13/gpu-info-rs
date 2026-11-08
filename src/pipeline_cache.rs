@@ -66,23 +66,18 @@ impl DiskPipelineCache {
     }
 }
 
-/// The pipeline cache of `device` (created from an adapter described by `adapter`), opened on first use and shared by
-/// every later caller with the same device; `None` when the device cannot keep one (module docs).
+/// The pipeline cache of `device` (created from an adapter described by `adapter`), seeded from the on-disk
+/// adapter cache file; `None` when the device cannot keep one (module docs).
+///
+/// Always creates the [`wgpu::PipelineCache`] directly on `device`: in `wgpu` 30, `wgpu::Device::eq` compares only
+/// the per-hub `DeviceId(index, epoch)` (`(0, 1)` for the first device of every `wgpu::Instance`), so caching
+/// `wgpu::PipelineCache` handles keyed by `wgpu::Device` across multiple `wgpu::Instance`s hands `Instance A`'s
+/// `PipelineCacheId(0, 1)` to `Instance B`'s `Device` and panics in `wgpu-core` storage lookup.
 pub fn pipeline_cache(
     device: &wgpu::Device,
     adapter: &wgpu::AdapterInfo,
 ) -> Option<Arc<DiskPipelineCache>> {
-    static CACHES: Mutex<Vec<(wgpu::Device, Option<Arc<DiskPipelineCache>>)>> =
-        Mutex::new(Vec::new());
-    let mut caches = CACHES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((_, cache)) = caches.iter().find(|(known, _)| known == device) {
-        return cache.clone();
-    }
-    let cache = open(device, adapter).map(Arc::new);
-    caches.push((device.clone(), cache.clone()));
-    cache
+    open(device, adapter).map(Arc::new)
 }
 
 /// `device.create_compute_pipeline(desc)` through the device's persistent cache ([`pipeline_cache`], whatever `desc`
@@ -160,10 +155,13 @@ fn fingerprint(data: &[u8]) -> (usize, u64) {
 }
 
 fn write_atomically(file: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let temp = file.with_extension(format!("{}.tmp", std::process::id()));
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let temp = file.with_extension(format!("{}.{seq}.tmp", std::process::id()));
     std::fs::write(&temp, data)?;
     std::fs::rename(&temp, file)
 }
@@ -254,5 +252,66 @@ mod tests {
                 .is_some_and(|data| !data.is_empty())
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression test for cross-`wgpu::Instance` `DeviceId(0, 1)` collision:
+    /// two independent `wgpu::Instance`s both assign `DeviceId(0, 1)` to their first `wgpu::Device`,
+    /// so `device_a == device_b` is `true` in `wgpu` 30. Calling `create_compute_pipeline` on both
+    /// must never reuse `Instance A`'s `PipelineCacheId(0, 1)` on `Instance B`.
+    #[test]
+    fn two_wgpu_instances_do_not_collide_on_pipeline_cache_id() {
+        let make_device = || -> Option<(wgpu::Device, wgpu::AdapterInfo)> {
+            let instance = wgpu::Instance::default();
+            let adapter =
+                pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    ..Default::default()
+                }))
+                .ok()?;
+            let info = adapter.get_info();
+            let mut required_features = wgpu::Features::empty();
+            if adapter.features().contains(wgpu::Features::PIPELINE_CACHE) {
+                required_features |= wgpu::Features::PIPELINE_CACHE;
+            }
+            let (device, _queue) =
+                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                    label: Some("test-multi-instance-pcache"),
+                    required_features,
+                    ..Default::default()
+                }))
+                .ok()?;
+            Some((device, info))
+        };
+
+        let Some((dev_a, info_a)) = make_device() else {
+            return;
+        };
+        let Some((dev_b, info_b)) = make_device() else {
+            return;
+        };
+
+        let wgsl = "@group(0) @binding(0) var<storage, read_write> v: array<f32>;
+            @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) i: vec3<u32>) {
+                v[i.x] = v[i.x] + 1.0;
+            }";
+
+        for (dev, info) in [(&dev_a, &info_a), (&dev_b, &info_b)] {
+            let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: None,
+                source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+            });
+            let _pipeline = create_compute_pipeline(
+                dev,
+                info,
+                &wgpu::ComputePipelineDescriptor {
+                    label: None,
+                    layout: None,
+                    module: &module,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                },
+            );
+        }
     }
 }
