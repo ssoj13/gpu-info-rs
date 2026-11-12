@@ -509,7 +509,9 @@ pub(crate) fn open_shared(
 
     // SAFETY: `open` was created from this adapter, and the descriptor asks for exactly the
     // features and limits it was opened with. Experimental features are enabled because CubeCL's
-    // SPIR-V (and Metal MSL) passthrough needs that opt-in; no experimental FEATURE is requested.
+    // SPIR-V (and Metal MSL) passthrough needs that opt-in and because `shared_device` asks for
+    // `EXPERIMENTAL_RAY_QUERY` where the adapter has it (`ray_query_request`, the only experimental
+    // FEATURE requested).
     let (device, queue) = unsafe {
         adapter.create_device_from_hal(
             open,

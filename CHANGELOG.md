@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-11-12
+
+- `ray_query_request(adapter) -> RayQueryRequest { features, experimental }` (additive): the one
+  place in the cluster that requests hardware ray query (`EXPERIMENTAL_RAY_QUERY` + wgpu's
+  experimental opt-in, or nothing on an adapter without it). Device hosts OR `features` into
+  `required_features` and pass `experimental`, so render-rs's path tracer (`pt-megakernel`
+  `TraversalBackend::Auto`) traverses driver BLAS/TLAS instead of its software BVH.
+- `shared_device()` requests it on both the Vulkan video path and the ordinary path, and logs the
+  `request_device` error before returning `None`. No other experimental feature is requested.
+
 ## 2026-10-19
 
 - `gpu_info::stats::query_all() -> Vec<GpuStats>` (additive): enumerates live counters for all hardware GPUs on a host

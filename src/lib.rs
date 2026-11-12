@@ -358,6 +358,42 @@ fn stable_features() -> wgpu::Features {
         .difference(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS)
 }
 
+/// Hardware ray query as a device request: what a `wgpu::DeviceDescriptor` adds so render-rs's
+/// path tracer can traverse driver BLAS/TLAS instead of its software BVH (`pt-megakernel`
+/// `TraversalBackend::Auto`, 7-20x faster on RTX-class GPUs).
+///
+/// THE one place in the cluster that turns wgpu's experimental opt-in on for ray query: every
+/// device host ([`shared_device`] and the hosts that create their own device) ORs `features` into
+/// `required_features` and passes `experimental` as `experimental_features`, so the request and its
+/// safety argument cannot drift between hosts.
+#[cfg(feature = "wgpu")]
+#[derive(Clone, Copy, Debug)]
+pub struct RayQueryRequest {
+    /// `EXPERIMENTAL_RAY_QUERY` when the adapter reports it, else empty.
+    pub features: wgpu::Features,
+    /// wgpu's experimental opt-in when `features` is non-empty, else disabled: an adapter without
+    /// ray query gets no experimental surface at all.
+    pub experimental: wgpu::ExperimentalFeatures,
+}
+
+/// [`RayQueryRequest`] for `adapter`.
+#[cfg(feature = "wgpu")]
+pub fn ray_query_request(adapter: &wgpu::Adapter) -> RayQueryRequest {
+    let features = adapter.features() & wgpu::Features::EXPERIMENTAL_RAY_QUERY;
+    let experimental = if features.is_empty() {
+        wgpu::ExperimentalFeatures::disabled()
+    } else {
+        // SAFETY: wgpu's contract for the opt-in is that experimental features may carry
+        // implementation bugs. Only `EXPERIMENTAL_RAY_QUERY` is requested through it here, and its
+        // one consumer (render-rs `pt-megakernel` hardware traversal) builds acceleration
+        // structures and ray queries strictly within wgpu's documented ray-query rules (finite ray
+        // descriptions, committed hits read after traversal, confirm only on triangle candidates;
+        // see that crate's `hw_accel.rs`).
+        unsafe { wgpu::ExperimentalFeatures::enabled() }
+    };
+    RayQueryRequest { features, experimental }
+}
+
 /// The high-performance, non-fallback adapter of `instance`: the real discrete GPU, not a software
 /// rasterizer.
 #[cfg(feature = "wgpu")]
@@ -401,10 +437,9 @@ pub fn shared_instance_descriptor() -> wgpu::InstanceDescriptor {
 /// `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` for its fast path finds them present, while an
 /// adopter that doesn't simply ignores them. `MAPPABLE_PRIMARY_BUFFERS` is excluded because wgpu
 /// treats enabling it on a discrete GPU as a performance footgun and nobody maps primary buffers.
-/// Experimental features (ray-query, mesh-shader,
-/// cooperative-matrix …) are excluded on purpose: wgpu 30 rejects them at `request_device` unless
-/// the caller flips an `unsafe { ExperimentalFeatures::enabled() }` opt-in, and requesting them
-/// would make the whole negotiation fail with "experimental features are not enabled".
+/// Of the experimental features only hardware ray query is requested, through
+/// [`ray_query_request`] (where the adapter has it): render-rs's path tracer runs its driver
+/// traversal on it. Mesh shaders, cooperative matrices and the rest stay off.
 ///
 /// **The module containing this crate is pinned first** (never unmapped for the rest of the
 /// process). The shared device is process-lifetime state: it lives in a `static` that is never
@@ -451,8 +486,8 @@ pub fn shared_device() -> Option<&'static SharedGpu> {
             let _creating = DEVICE_CREATION
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let stable = stable_features();
-            let features = stable & adapter.features();
+            let ray_query = ray_query_request(&adapter);
+            let features = (stable_features() & adapter.features()) | ray_query.features;
             let limits = adapter.limits();
 
             // FIRST try the device that serves both halves: wgpu compute AND hardware video
@@ -476,7 +511,15 @@ pub fn shared_device() -> Option<&'static SharedGpu> {
                  memory",
                 adapter.get_info().backend
             );
-            let (device, queue) = pollster::block_on(request_max_device(&adapter, stable)).ok()?;
+            let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("gpu-info shared device"),
+                required_features: features,
+                required_limits: limits,
+                experimental_features: ray_query.experimental,
+                ..Default::default()
+            }))
+            .inspect_err(|e| log::error!("gpu-info: no shared device: request_device failed: {e}"))
+            .ok()?;
             Some(SharedGpu {
                 device,
                 queue,
@@ -817,6 +860,26 @@ mod tests {
             (None, None) => {}
             _ => unreachable!("is_some() equality already asserted above"),
         }
+    }
+
+    /// The shared device carries hardware ray query exactly when its adapter has it, and the
+    /// request turns wgpu's experimental opt-in on only then. Without a GPU there is nothing to
+    /// check (reported, not silently passed).
+    #[test]
+    fn shared_device_requests_ray_query_where_supported() {
+        let Some(gpu) = shared_device() else {
+            eprintln!("shared_device_requests_ray_query_where_supported: no GPU adapter; skipped");
+            return;
+        };
+        let request = ray_query_request(&gpu.adapter);
+        let supported = gpu.adapter.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY);
+        assert_eq!(request.features.contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY), supported);
+        assert_eq!(request.features.is_empty(), !supported, "nothing but ray query is requested");
+        assert_eq!(
+            gpu.device.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY),
+            supported,
+            "the shared device must carry ray query exactly when the adapter supports it"
+        );
     }
 
     #[test]
