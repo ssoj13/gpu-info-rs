@@ -104,3 +104,11 @@ libc = "0.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
 objc2-metal = { version = "0.3.2", features = ["MTLDevice"] }
+
+# wasm32 without threads (the browser, wasm32-wasip1): the WebGPU backend keeps `Rc`/`RefCell`
+# inside wgpu's types, so they are not Send/Sync, and the process-wide statics here
+# (`SHARED`, `COMPUTE`, `pool::COMPUTE_BUFFERS`, ...) cannot hold them. With no second thread on
+# such a target, Send/Sync cannot be violated; this wgpu feature declares them so. Same `optional`
+# dependency as above, so the `wgpu` feature still decides whether wgpu is built at all.
+[target.'cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))'.dependencies]
+wgpu = { version = "30", features = ["fragile-send-sync-non-atomic-wasm"], optional = true }

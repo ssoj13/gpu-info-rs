@@ -9,6 +9,17 @@ reuse/dirty-clear/completion gate passed. Strict all-target/all-feature Clippy
 passed. The OS RAM smoke checks its formula on one snapshot rather than
 comparing independently changing live readings.
 
+## wasm32 builds (2026-11-12)
+
+`cargo check --lib --target wasm32-unknown-unknown` passes with the default features and with
+`--no-default-features --features wgpu`. The WebGPU backend keeps `Rc`/`RefCell` inside wgpu's
+types, so they are not Send/Sync and the statics (`SHARED`, `COMPUTE`, `pool::COMPUTE_BUFFERS`)
+could not hold them. `Cargo.toml` turns on wgpu's `fragile-send-sync-non-atomic-wasm` ONLY for
+`wasm32` without `atomics` (no second thread exists there). Do not enable it for
+`wasm32` with `atomics`: there the claim would be false. Compiling is not running: device
+creation still blocks through `pollster`, which a browser cannot do. Consumer: exr-rs
+(exv-gpu-kernels, exv-gpu).
+
 ## The compute device's optical-flow queue and raw handles (VK1, 2026-10-15, branch `waveR-vk1`)
 
 `compute_device_status` opens the device through `compute_vk::open_compute` (`open_with_callback`, the `shared_vk`

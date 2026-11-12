@@ -9,6 +9,9 @@
   `TraversalBackend::Auto`) traverses driver BLAS/TLAS instead of its software BVH.
 - `shared_device()` requests it on both the Vulkan video path and the ordinary path, and logs the
   `request_device` error before returning `None`. No other experimental feature is requested.
+- Builds for `wasm32-unknown-unknown` (default features and `wgpu` only): wgpu's
+  `fragile-send-sync-non-atomic-wasm` is enabled for `wasm32` without `atomics`, where the WebGPU
+  backend's `Rc`-based types otherwise cannot live in the crate's statics. Native targets unchanged.
 
 ## 2026-10-19
 
