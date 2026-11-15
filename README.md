@@ -62,6 +62,14 @@ Consumers must compile Vulkan handle/HAL access behind the same target predicate
 Checking `vulkan.is_some()` at runtime cannot make unsupported fields or Vulkan HAL types
 exist at compile time. See [the consumer rules](AGENTS.md#native-vulkan-consumer-boundary-2026-10-06).
 
+`shared_device()` and `compute_device()` also negotiate Vulkan external-memory and
+external-semaphore extensions (`VK_KHR_external_memory_{win32,fd}`,
+`VK_KHR_external_semaphore_{win32,fd}`, and `VK_KHR_timeline_semaphore` on Vulkan < 1.2)
+when supported by the adapter. Query `SharedGpu::has_external_interop()`,
+`ComputeGpu::has_external_interop()`, `VulkanShared::has_external_interop()`, or
+`gpu_info::device_has_external_interop(&device)` before enabling zero-copy Vulkan↔CUDA/OptiX
+interop.
+
 The macOS source fix is `35a81c9` (2026-10-06). FFmpeg's downstream bridge fix is
 `5f0e71c`; Playa `a03156b` pins both. This documentation refresh adds no build/test evidence;
 current macOS compilation, linking and hardware acceptance remain unverified.

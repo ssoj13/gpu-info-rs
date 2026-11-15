@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-11-14
+
+- **Vulkan external memory & semaphore interop negotiation** (`shared_vk`, `lib.rs`, `shared_vk_unavailable`):
+  - Negotiates platform external-memory and external-semaphore Vulkan extensions on `shared_device()` and `compute_device()` (`VK_KHR_external_memory_win32` + `VK_KHR_external_semaphore_win32` on Windows; `VK_KHR_external_memory_fd` + `VK_KHR_external_semaphore_fd` on Unix; plus Vulkan 1.0/1.1 prerequisites and `VK_KHR_timeline_semaphore` on Vulkan < 1.2) whenever advertised by the adapter.
+  - Added deterministic capability queries `device_has_external_interop(&wgpu::Device) -> bool`, `SharedGpu::has_external_interop()`, `ComputeGpu::has_external_interop()`, and `VulkanShared::has_external_interop()` for zero-copy Vulkan↔CUDA/OptiX interop (`render-rs` / `nv-rs`), returning `false` cleanly on software/non-interop adapters.
+
 ## 2026-11-12
 
 - `ray_query_request(adapter) -> RayQueryRequest { features, experimental }` (additive): the one
