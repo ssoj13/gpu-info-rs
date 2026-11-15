@@ -370,6 +370,23 @@ pub fn device_has_external_interop(device: &wgpu::Device) -> bool {
     false
 }
 
+/// Dedicated Vulkan `(family, index)` reserved for external-interop (`nv-wgpu`) barriers on
+/// `device`, distinct from `wgpu`'s own queue so raw `vkQueueSubmit` never races
+/// `wgpu::Queue::submit` or `SurfaceTexture::present`.
+#[must_use]
+#[cfg(feature = "wgpu")]
+pub fn device_vulkan_interop_queue(device: &wgpu::Device) -> Option<(u32, u32)> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        shared_vk::vulkan_device_interop_queue(device)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = device;
+        None
+    }
+}
+
 #[cfg(feature = "wgpu")]
 impl SharedGpu {
     /// Whether zero-copy GPU<->CUDA external memory and timeline-semaphore interop is active on
@@ -377,6 +394,12 @@ impl SharedGpu {
     #[must_use]
     pub fn has_external_interop(&self) -> bool {
         device_has_external_interop(&self.device)
+    }
+
+    /// Dedicated Vulkan `(family, index)` reserved for external-interop barriers, if available.
+    #[must_use]
+    pub fn vulkan_interop_queue(&self) -> Option<(u32, u32)> {
+        device_vulkan_interop_queue(&self.device)
     }
 }
 
@@ -387,6 +410,12 @@ impl WorkContext {
     #[must_use]
     pub fn has_external_interop(&self) -> bool {
         device_has_external_interop(self.device())
+    }
+
+    /// Dedicated Vulkan `(family, index)` reserved for external-interop barriers, if available.
+    #[must_use]
+    pub fn vulkan_interop_queue(&self) -> Option<(u32, u32)> {
+        device_vulkan_interop_queue(self.device())
     }
 }
 

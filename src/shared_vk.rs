@@ -109,6 +109,12 @@ static PRIORITY: [f32; 1] = [1.0];
 /// count means replacing the slice - bumping the number alone would have the driver read a float
 /// past the end of a one-element array.
 static PRIORITY_PAIR: [f32; 2] = [1.0, 1.0];
+static PRIORITY_TRIPLE: [f32; 3] = [1.0, 1.0, 1.0];
+
+/// Process-local registry of dedicated Vulkan interop barrier queues `(family, index)`
+/// keyed by raw `VkDevice` handle, so `device_vulkan_interop_queue(&wgpu::Device)` can
+/// query it without changing `wgpu::Device` ownership.
+static INTEROP_QUEUES: std::sync::Mutex<Vec<(u64, (u32, u32))>> = std::sync::Mutex::new(Vec::new());
 
 /// The queue family wgpu renders on.
 ///
@@ -156,6 +162,10 @@ pub struct VulkanShared {
     /// submit to. `None` means no such queue could be reserved, and a consumer must say so rather
     /// than fall back to somebody else's queue.
     pub compute_queue: Option<(u32, u32)>,
+    /// A dedicated `(family, index)` in [`Self::main_queue`]'s family for external-interop
+    /// (`nv-wgpu`) ownership/layout barriers, distinct from `main_queue` so raw `vkQueueSubmit`
+    /// never races `wgpu::Queue::submit` or `SurfaceTexture::present`.
+    pub interop_queue: Option<(u32, u32)>,
     /// The video extensions actually enabled on the device, in request order.
     pub video_extensions: Vec<&'static CStr>,
     /// Every device extension enabled at `vkCreateDevice`, not only the video ones.
@@ -313,6 +323,22 @@ fn present_interop_ext(adapter: &wgpu::hal::vulkan::Adapter) -> InteropNegotiati
         device_api_version,
         |ext| caps.supports_extension(ext),
     )
+}
+
+/// Returns the dedicated Vulkan `(family, index)` reserved for external-interop barriers on
+/// `device`, if this device was opened with one via [`open_shared`].
+#[must_use]
+pub(crate) fn vulkan_device_interop_queue(device: &wgpu::Device) -> Option<(u32, u32)> {
+    use ash::vk::Handle as _;
+    // SAFETY: Read-only inspection of wgpu's Vulkan HAL device handle.
+    let hal_dev = unsafe { device.as_hal::<Vulkan>() }?;
+    let raw = hal_dev.raw_device().handle().as_raw();
+    INTEROP_QUEUES
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(dev, _)| *dev == raw)
+        .map(|(_, q)| *q)
 }
 
 /// Checks whether an already-created Vulkan `wgpu::Device` has all extensions and API capabilities
@@ -488,7 +514,7 @@ pub(crate) fn open_shared(
     };
     let vp9_feat_ref = &mut vp9_feat;
 
-    let (video_ext, decode, compute, sync2_on, external_interop, open) = unsafe {
+    let (video_ext, decode, compute, interop_queue, sync2_on, external_interop, open) = unsafe {
         let hal = adapter.as_hal::<Vulkan>()?;
         let raw_video_ext = present_video_ext(&hal);
         let has_video_core = VIDEO_CORE.iter().all(|e| raw_video_ext.contains(e));
@@ -576,7 +602,29 @@ pub(crate) fn open_shared(
         // raised by replacing that entry's priority slice - one entry per family is a hard rule
         // (VUID-VkDeviceCreateInfo-queueFamilyIndex-02802), so a second create-info for the same
         // family would be invalid usage rather than a second queue.
-        let pair_in_main = compute == Some((WGPU_FAMILY, 1));
+        // Reserve a dedicated queue in `WGPU_FAMILY` for `nv-wgpu` ownership/layout barriers
+        // whenever external interop is enabled and the family has a spare queue. Keeping it in
+        // `WGPU_FAMILY` lets `VK_QUEUE_FAMILY_EXTERNAL <-> WGPU_FAMILY` transitions stay valid for
+        // `wgpu` on `(WGPU_FAMILY, 0)` without ever calling raw `vkQueueSubmit` on `wgpu`'s queue.
+        let main_family_queues = queue_families
+            .get(WGPU_FAMILY as usize)
+            .map_or(0, |f| f.queue_count);
+        let interop_queue = if interop.external_interop {
+            if compute == Some((WGPU_FAMILY, 1)) {
+                (main_family_queues >= 3).then_some((WGPU_FAMILY, 2))
+            } else {
+                (main_family_queues >= 2).then_some((WGPU_FAMILY, 1))
+            }
+        } else {
+            None
+        };
+        let main_queue_count: usize = if interop_queue == Some((WGPU_FAMILY, 2)) {
+            3
+        } else if compute == Some((WGPU_FAMILY, 1)) || interop_queue == Some((WGPU_FAMILY, 1)) {
+            2
+        } else {
+            1
+        };
         let open = hal
             .open_with_callback(
                 features,
@@ -612,12 +660,17 @@ pub(crate) fn open_shared(
                     if let Some((family, _)) = compute.filter(|(f, _)| *f != WGPU_FAMILY) {
                         want(family);
                     }
-                    if pair_in_main {
+                    if main_queue_count > 1 {
                         // wgpu keeps index 0 of this entry (it passes its own pre-callback copy
-                        // of the family index and the literal 0 to `device_from_raw`), so index 1
-                        // is ours.
+                        // of the family index and the literal 0 to `device_from_raw`), so indices
+                        // 1..main_queue_count are ours.
                         if let Some(first) = args.queue_create_infos.first_mut() {
-                            *first = first.queue_priorities(&PRIORITY_PAIR);
+                            let priorities: &'static [f32] = if main_queue_count >= 3 {
+                                &PRIORITY_TRIPLE
+                            } else {
+                                &PRIORITY_PAIR
+                            };
+                            *first = first.queue_priorities(priorities);
                         }
                     }
                     // Chain `synchronization2` on, but only where the device can really have it:
@@ -648,6 +701,7 @@ pub(crate) fn open_shared(
             video_ext,
             decode,
             compute,
+            interop_queue,
             sync2_on,
             interop.external_interop,
             open,
@@ -681,6 +735,7 @@ pub(crate) fn open_shared(
             main_queue,
             decode_queue: decode.map(|d| (d, 0)),
             compute_queue: compute,
+            interop_queue: if external_interop { interop_queue } else { None },
             video_extensions: video_ext,
             device_extensions: all_extensions
                 .lock()
@@ -734,12 +789,23 @@ pub(crate) fn open_shared(
     .inspect_err(|e| log::warn!("gpu-info: wgpu refused the shared Vulkan device: {e}"))
     .ok()?;
 
+    if let Some(iq) = raw.interop_queue {
+        use ash::vk::Handle as _;
+        if let Ok(mut guard) = INTEROP_QUEUES.lock() {
+            let dev_raw = raw.device.handle().as_raw();
+            if !guard.iter().any(|(d, _)| *d == dev_raw) {
+                guard.push((dev_raw, iq));
+            }
+        }
+    }
+
     log::info!(
         "gpu-info: shared Vulkan device: wgpu on {:?}, decode on {:?}, compute on {:?}, \
-         external_interop={}, video extensions {:?}",
+         interop on {:?}, external_interop={}, video extensions {:?}",
         raw.main_queue,
         raw.decode_queue,
         raw.compute_queue,
+        raw.interop_queue,
         raw.external_interop,
         raw.video_extensions
     );
