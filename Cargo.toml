@@ -112,3 +112,9 @@ objc2-metal = { version = "0.3.2", features = ["MTLDevice"] }
 # dependency as above, so the `wgpu` feature still decides whether wgpu is built at all.
 [target.'cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))'.dependencies]
 wgpu = { version = "30", features = ["fragile-send-sync-non-atomic-wasm"], optional = true }
+
+# A browser page (wasm32 / wasm64, no OS): `os::sys_mem` reads `navigator.deviceMemory` and the
+# module's linear memory size (`src/web_mem.rs`).
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"

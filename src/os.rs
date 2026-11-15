@@ -180,7 +180,18 @@ fn sys_mem_platform() -> Option<SysMemInfo> {
     })
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+/// A browser page (wasm32 / wasm64, no OS): `navigator.deviceMemory` bounded by the address space.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+fn sys_mem_platform() -> Option<SysMemInfo> {
+    crate::web_mem::sys_mem()
+}
+
+#[cfg(not(any(
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "macos",
+    all(target_family = "wasm", target_os = "unknown")
+)))]
 fn sys_mem_platform() -> Option<SysMemInfo> {
     None
 }

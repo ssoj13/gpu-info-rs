@@ -343,6 +343,7 @@ dependencies = [
  "bytemuck",
  "clap",
  "half",
+ "js-sys",
  "libc",
  "log",
  "objc2",
@@ -351,6 +352,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "wasm-bindgen",
  "wgpu",
  "windows",
 ]

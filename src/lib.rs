@@ -116,6 +116,9 @@ pub use resources::{
 /// Windows RAM via `GlobalMemoryStatusEx` (a syscall, not a `wmic` process spawn) — see [`win_mem`].
 #[cfg(windows)]
 mod win_mem;
+/// Browser RAM (wasm32 / wasm64 page): `navigator.deviceMemory` bounded by the address space.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+mod web_mem;
 
 /// The displays' ICC profiles from the OS (OCIO's `SystemMonitors` source), wgpu-free.
 pub mod displays;
