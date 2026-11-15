@@ -14,6 +14,20 @@ pub struct VulkanShared {
     _unavailable: (),
 }
 
+impl VulkanShared {
+    /// Always `false` on targets without wgpu's native Vulkan HAL backend.
+    #[must_use]
+    pub fn has_external_interop(&self) -> bool {
+        false
+    }
+}
+
+/// Always `false` on targets without wgpu's native Vulkan HAL backend.
+#[must_use]
+pub(crate) fn vulkan_device_has_external_interop(_device: &wgpu::Device) -> bool {
+    false
+}
+
 /// No Vulkan HAL exists on this target, so the caller must use its ordinary native backend.
 pub(crate) fn open_shared(
     _adapter: &wgpu::Adapter,

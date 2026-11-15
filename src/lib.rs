@@ -334,13 +334,57 @@ pub struct SharedGpu {
     pub instance: wgpu::Instance,
     /// The same device seen as raw Vulkan, when it could be created that way.
     ///
-    /// `Some` means this device also carries the video extensions and a decode queue family, so a
-    /// hardware decoder can run on it and hand its images straight to wgpu with no copy (see
-    /// [`shared_vk`]). `None` means the adapter is not Vulkan, or has no video-decode queue: a
-    /// decoder then needs its own device and every decoded frame costs a round trip through host
-    /// memory. Consumers that care must CHECK this rather than assume it.
+    /// `Some` means this device was opened through [`shared_vk`] with whichever optional video-decode
+    /// and external-interop extensions the Vulkan adapter supports. Check [`shared_vk::VulkanShared::decode_queue`]
+    /// for hardware video decode and [`Self::has_external_interop`] /
+    /// [`shared_vk::VulkanShared::has_external_interop`] for zero-copy Vulkan<->CUDA interop.
     #[cfg(not(target_arch = "wasm32"))]
     pub vulkan: Option<shared_vk::VulkanShared>,
+}
+
+/// Returns `true` when `device` has active zero-copy external-memory and timeline-semaphore
+/// interop support compatible with CUDA/OptiX (`nv-wgpu`):
+/// - On Vulkan (Windows/Linux/Android/FreeBSD): all platform external-memory (`_win32` / `_fd`),
+///   external-semaphore (`_win32` / `_fd`), timeline-semaphore, and UUID capabilities are enabled
+///   on `device`.
+/// - On Direct3D 12 (Windows): `device` uses the DX12 HAL backend (which natively supports shared
+///   NT heaps and fences).
+/// - On all other backends and `wasm32`: `false`.
+#[must_use]
+#[cfg(feature = "wgpu")]
+pub fn device_has_external_interop(device: &wgpu::Device) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    if shared_vk::vulkan_device_has_external_interop(device) {
+        return true;
+    }
+    #[cfg(windows)]
+    // SAFETY: Read-only check whether `device` is backed by the DX12 HAL.
+    if unsafe { device.as_hal::<wgpu::hal::api::Dx12>() }.is_some() {
+        return true;
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = device;
+    false
+}
+
+#[cfg(feature = "wgpu")]
+impl SharedGpu {
+    /// Whether zero-copy GPU<->CUDA external memory and timeline-semaphore interop is active on
+    /// [`Self::device`].
+    #[must_use]
+    pub fn has_external_interop(&self) -> bool {
+        device_has_external_interop(&self.device)
+    }
+}
+
+#[cfg(feature = "wgpu")]
+impl WorkContext {
+    /// Whether zero-copy GPU<->CUDA external memory and timeline-semaphore interop is active on
+    /// [`Self::device`].
+    #[must_use]
+    pub fn has_external_interop(&self) -> bool {
+        device_has_external_interop(self.device())
+    }
 }
 
 /// Held while either process-wide device ([`shared_device`], [`compute_device`]) is created: wgpu
@@ -497,6 +541,13 @@ pub fn shared_device() -> Option<&'static SharedGpu> {
             if let Some((device, queue, vulkan)) =
                 shared_vk::open_shared(&adapter, features, &limits)
             {
+                if vulkan.decode_queue.is_none() {
+                    log::warn!(
+                        "gpu-info: shared Vulkan device opened without video-decode queue \
+                         (external_interop={}); a hardware video decoder will need its own device",
+                        vulkan.has_external_interop()
+                    );
+                }
                 return Some(SharedGpu {
                     device,
                     queue,
