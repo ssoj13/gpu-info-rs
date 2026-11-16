@@ -11,6 +11,8 @@
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct VulkanShared {
+    /// Always `None` on targets without wgpu's native Vulkan HAL backend.
+    pub decode_queue: Option<(u32, u32)>,
     _unavailable: (),
 }
 
@@ -26,6 +28,12 @@ impl VulkanShared {
 #[must_use]
 pub(crate) fn vulkan_device_has_external_interop(_device: &wgpu::Device) -> bool {
     false
+}
+
+/// Always `None` on targets without wgpu's native Vulkan HAL backend.
+#[must_use]
+pub(crate) fn vulkan_device_interop_queue(_device: &wgpu::Device) -> Option<(u32, u32)> {
+    None
 }
 
 /// No Vulkan HAL exists on this target, so the caller must use its ordinary native backend.
