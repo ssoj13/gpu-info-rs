@@ -496,12 +496,17 @@ pub struct VramWatch {
     state: std::sync::Mutex<WatchState>,
 }
 
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use std::time::Instant as WatchInstant;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use web_time::Instant as WatchInstant;
+
 /// The last reading of a [`VramWatch`].
 struct WatchState {
     /// The device the reading is of.
     device: Option<AdapterKey>,
     budget: Option<u64>,
-    at: Option<std::time::Instant>,
+    at: Option<WatchInstant>,
     /// The last reading failed (and said so): a success logs the recovery.
     failing: bool,
 }
@@ -578,7 +583,7 @@ impl VramWatch {
             }
             _ => {}
         }
-        state.at = Some(std::time::Instant::now());
+        state.at = Some(WatchInstant::now());
         state.budget
     }
 }

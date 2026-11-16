@@ -588,13 +588,13 @@ impl WorkQueue {
         if self.pending.len() <= max_pending || self.poisoned || timeout.is_zero() {
             return Ok(total_completed);
         }
-        let start = std::time::Instant::now();
+        let start = super::Instant::now();
         let deadline = start.checked_add(timeout);
         loop {
             if self.pending.len() <= max_pending || self.poisoned {
                 break;
             }
-            let now = std::time::Instant::now();
+            let now = super::Instant::now();
             let remaining = match deadline {
                 Some(deadline) => {
                     if now >= deadline {

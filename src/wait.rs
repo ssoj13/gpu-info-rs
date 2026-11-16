@@ -42,7 +42,11 @@
 //! failed map.
 
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use std::time::Instant;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use web_time::Instant;
 
 /// The longest a waiter sleeps between two non-blocking polls when no other thread's poll wakes it.
 pub const POLL_PERIOD: Duration = Duration::from_millis(1);
