@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-11-16
+
+- **`wasm32-unknown-unknown` `Instant` fix** (`Cargo.toml`, `wait.rs`, `wait/work.rs`, `vram.rs`):
+  - Added `web-time = "1.1"` under `[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]` and gated `Instant` / `WatchInstant` to `web_time::Instant` on `wasm32-unknown-unknown` so `gpu_info::submit(...)`, `wait_for_slots(...)`, and `VramWatch::query(...)` no longer panic with `time not implemented on this platform` in browser WebGPU builds.
+
 ## 2026-11-14
 
 - **Vulkan external memory & semaphore interop negotiation** (`shared_vk`, `lib.rs`, `shared_vk_unavailable`):
