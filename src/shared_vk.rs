@@ -256,12 +256,23 @@ fn negotiate_interop_extensions(
     device_api_version: u32,
     supports_ext: impl Fn(&CStr) -> bool,
 ) -> InteropNegotiation {
-    let mut extensions = Vec::with_capacity(7);
+    let mut extensions = Vec::with_capacity(11);
     let push_unique = |list: &mut Vec<&'static CStr>, ext: &'static CStr| {
         if !list.contains(&ext) {
             list.push(ext);
         }
     };
+
+    for ngx_ext in [
+        c"VK_NVX_binary_import",
+        c"VK_NVX_image_view_handle",
+        c"VK_KHR_push_descriptor",
+        c"VK_KHR_buffer_device_address",
+    ] {
+        if supports_ext(ngx_ext) {
+            push_unique(&mut extensions, ngx_ext);
+        }
+    }
 
     #[cfg(any(windows, unix))]
     let (mem_ok, sem_ok) = {
