@@ -39,8 +39,8 @@
 //! # On the FFI
 //!
 //! DXGI and PDH have no pure-Rust route: they are the OS. All `unsafe` is confined to this
-//! file behind [`query`], exactly as `win_mem` confines `GlobalMemoryStatusEx` and
-//! [`super::apple`] confines IOKit.
+//! file behind [`query_all`], exactly as `win_mem` confines `GlobalMemoryStatusEx` and
+//! `stats::apple` confines IOKit on macOS.
 
 use std::cell::RefCell;
 

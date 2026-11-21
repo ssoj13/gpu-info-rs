@@ -5,12 +5,12 @@
 //! estimator of ofx-rs `ofx-motion` (`vk_nv`) then runs on the SAME `VkDevice` the plug-ins' wgpu compute runs on: no
 //! second device, no external memory between them. A device without them opens as before (`optical_flow: None`).
 //!
-//! The raw handles are read once here ([`VulkanHandles`]) so no consumer calls `as_hal` for them (ofx-motion `vk_nv`,
+//! The raw handles are read once here (`VulkanHandles`) so no consumer calls `as_hal` for them (ofx-motion `vk_nv`,
 //! the vfx-compute native Vulkan executor R2). The wgpu features requested are the caller's (every stable feature the
 //! adapter has), so `VULKAN_EXTERNAL_MEMORY_WIN32` (the Vulkan-site import, `external::SharedBuffer::import`) is
 //! enabled exactly as by the former `request_max_device`.
 //!
-//! **Replaces** the plain `request_max_device` of `compute_device_status`; the pattern is [`crate::shared_vk`]'s
+//! **Replaces** the plain `request_max_device` of `compute_device_status`; the pattern is `crate::shared_vk`'s
 //! (queues and a feature struct added by the callback, the enabled extensions recorded inside it).
 //!
 //! **Trap:** the optical-flow queue is externally synchronised; its one submitter is ofx-motion `vk_nv`, which owns

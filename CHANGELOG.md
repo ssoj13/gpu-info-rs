@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-11-21
+
+- **`Backends::PRIMARY` default with automatic GL-only fallback in `shared_device()` & `compute_device()`** (`src/lib.rs`, `examples/unload_probe.rs`):
+  - `shared_instance_descriptor()` now starts from `wgpu::Backends::PRIMARY` (Vulkan | DX12 | Metal | BrowserWebGpu) before applying `.with_env()`, so Windows no longer initializes WGL or spawns the unused `"wgpu-hal WGL Instance Thread"` and its hidden window on Vulkan/DX12 machines.
+  - Explicit `WGPU_BACKEND` overrides (including `WGPU_BACKEND=gl`, `dx12`, `vulkan`) are preserved with zero silent downgrade; when `WGPU_BACKEND` is unset and no `PRIMARY` adapter is available, `shared_device()` and `compute_device()` fall back cleanly to a `Backends::GL` instance.
+- **macOS (`aarch64-apple-darwin`) `shared_vk_unavailable` parity** (`src/shared_vk_unavailable.rs`):
+  - Added `VulkanShared::decode_queue` and `vulkan_device_interop_queue` to the non-Vulkan target stub so `cargo check --lib --target aarch64-apple-darwin` compiles cleanly with 0 errors.
+- **Strict rustdoc clean across public and private items** (`src/vram.rs`, `src/stats/windows.rs`, `src/lib.rs`, `src/compute_vk.rs`):
+  - Fixed all broken/private intra-doc links (`AdapterKey` → `PhysId::Unknown`, `stats::windows` → `query_all` / `stats::apple`, and platform-gated `ComputeGpu::raw` / `VulkanHandles` / `shared_vk` links) so `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features` and `--document-private-items` both pass with 0 warnings on Windows and `aarch64-apple-darwin`.
+
 ## 2026-11-16
 
 - **`wasm32-unknown-unknown` `Instant` fix** (`Cargo.toml`, `wait.rs`, `wait/work.rs`, `vram.rs`):

@@ -266,10 +266,6 @@ mod imp {
         }
     }
 
-    pub(super) fn vram_budget_adapter(_adapter: &wgpu::Adapter) -> Option<u64> {
-        None
-    }
-
     pub(super) fn vram_budget_from_context(_ctx: GpuVramContext<'_>) -> Option<u64> {
         None
     }
@@ -368,8 +364,20 @@ fn budget_chainable<'a>(api_version: u32, mut extensions: impl Iterator<Item = &
 pub(crate) enum PhysId {
     /// The adapter's LUID (Windows; `VkPhysicalDeviceIDProperties::deviceLUID` or `DXGI_ADAPTER_DESC1`), unique per
     /// adapter in a boot session.
+    #[cfg(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd"
+    ))]
     Luid(u64),
     /// `VkPhysicalDeviceIDProperties::deviceUUID` (Vulkan without a valid LUID, i.e. Linux).
+    #[cfg(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd"
+    ))]
     Uuid([u8; 16]),
     /// The backend reports none (Metal, GL).
     Unknown,
@@ -380,10 +388,10 @@ pub(crate) enum PhysId {
 /// **Contract:** wgpu compares adapters by an id that is unique inside one `wgpu::Instance`, so adapters of two
 /// instances can share an id; the physical identity (LUID or UUID) tells those apart (two instances of the same
 /// physical card compare equal, which is right: it is one budget). Two identical cards differ in the physical
-/// identity whatever name, vendor or device id they report. Where the backend reports none ([`PhysId::Unknown`])
-/// only the handle compares, so keys of different instances on such a backend may collide: use one instance per
-/// watch there. Build it once with [`Self::of`]; comparing and cloning allocate nothing, so a cache hit costs no
-/// allocation.
+/// identity whatever name, vendor or device id they report. Where the backend reports none (`PhysId::Unknown`,
+/// e.g. Metal or GL) only the handle compares, so keys of different instances on such a backend may collide: use
+/// one instance per watch there. Build it once with [`Self::of`]; comparing and cloning allocate nothing, so a
+/// cache hit costs no allocation.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AdapterKey(Repr);
 

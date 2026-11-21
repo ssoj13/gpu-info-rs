@@ -28,6 +28,7 @@ impl std::fmt::Display for PinError {
 }
 
 /// An address inside this crate's code: whatever module contains it is the module to pin.
+#[cfg(any(windows, unix))]
 fn anchor() -> *const () {
     pin_containing_module as *const ()
 }

@@ -49,7 +49,7 @@ pub mod pipeline_cache;
 #[cfg(feature = "wgpu")]
 pub use pipeline_cache::{DiskPipelineCache, create_compute_pipeline, pipeline_cache};
 /// The compute device's Vulkan opening (ofx-rs VK1): `VK_NV_optical_flow` and one optical-flow queue when the adapter
-/// reports them, and the device's raw handles ([`ComputeGpu::optical_flow`], [`ComputeGpu::raw`]).
+/// reports them, and the device's raw handles ([`ComputeGpu::optical_flow`], `ComputeGpu::raw`).
 #[cfg(feature = "wgpu")]
 pub mod compute_vk;
 /// The shared device as raw Vulkan: video extensions, a decode queue, and the `ash` handles a
@@ -470,17 +470,60 @@ pub fn ray_query_request(adapter: &wgpu::Adapter) -> RayQueryRequest {
     RayQueryRequest { features, experimental }
 }
 
-/// The high-performance, non-fallback adapter of `instance`: the real discrete GPU, not a software
-/// rasterizer.
+/// Request the high-performance, non-fallback adapter of `instance`: the real discrete GPU, not a
+/// software rasterizer.
 #[cfg(feature = "wgpu")]
-fn high_performance_adapter(instance: &wgpu::Instance) -> Option<wgpu::Adapter> {
+fn request_high_performance_adapter(
+    instance: &wgpu::Instance,
+) -> Result<wgpu::Adapter, wgpu::RequestAdapterError> {
     pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         force_fallback_adapter: false,
         compatible_surface: None,
         apply_limit_buckets: false, // wgpu 30
     }))
-    .ok()
+}
+
+/// Whether `shared_device()` / `compute_device()` may fall back to `wgpu::Backends::GL` after
+/// finding no adapter on the initial instance: only when `WGPU_BACKEND` was NOT set explicitly, so
+/// an explicit backend override (`WGPU_BACKEND=vulkan`, `WGPU_BACKEND=dx12`, …) never silently
+/// downgrades to OpenGL.
+#[cfg(feature = "wgpu")]
+const fn should_fallback_to_gl(env_backends: Option<wgpu::Backends>) -> bool {
+    env_backends.is_none()
+}
+
+/// Build the shared/compute `wgpu::Instance` and negotiate its high-performance adapter.
+///
+/// Uses [`shared_instance_descriptor`] (`wgpu::Backends::PRIMARY` by default, or `WGPU_BACKEND`
+/// when set) first so Windows never initializes WGL or spawns `"wgpu-hal WGL Instance Thread"`
+/// plus its hidden window on Vulkan/DX12 machines. Falls back to a `wgpu::Backends::GL` instance
+/// only when no PRIMARY adapter is available and `WGPU_BACKEND` is unset.
+#[cfg(feature = "wgpu")]
+fn open_shared_instance_and_adapter() -> Result<(wgpu::Instance, wgpu::Adapter), wgpu::RequestAdapterError> {
+    let instance = wgpu::Instance::new(shared_instance_descriptor());
+    match request_high_performance_adapter(&instance) {
+        Ok(adapter) => Ok((instance, adapter)),
+        Err(primary_err) => {
+            if !should_fallback_to_gl(wgpu::Backends::from_env()) {
+                return Err(primary_err);
+            }
+            let mut gl_desc = wgpu::InstanceDescriptor::new_without_display_handle();
+            gl_desc.backends = wgpu::Backends::GL;
+            let gl_instance = wgpu::Instance::new(gl_desc.with_env());
+            match request_high_performance_adapter(&gl_instance) {
+                Ok(adapter) => {
+                    log::info!(
+                        "gpu-info: no PRIMARY backend adapter available ({primary_err}); \
+                         fell back to GL ({})",
+                        adapter.get_info().name
+                    );
+                    Ok((gl_instance, adapter))
+                }
+                Err(_) => Err(primary_err),
+            }
+        }
+    }
 }
 
 /// Cached result of THE single process-wide device negotiation. `None` = the negotiation ran and
@@ -489,13 +532,20 @@ fn high_performance_adapter(instance: &wgpu::Instance) -> Option<wgpu::Adapter> 
 #[cfg(feature = "wgpu")]
 static SHARED: std::sync::OnceLock<Option<SharedGpu>> = std::sync::OnceLock::new();
 
-/// The instance descriptor of [`shared_device`]: wgpu's defaults without a display handle, then
-/// every instance-level wgpu environment variable (`InstanceDescriptor::with_env`), so
-/// `WGPU_BACKEND` selects the shared device's backend for the process. With no such variable set it
-/// equals `InstanceDescriptor::new_without_display_handle()`.
+/// The instance descriptor of [`shared_device`] and [`compute_device`]: starts from
+/// [`wgpu::Backends::PRIMARY`] (Vulkan | DX12 | Metal | BrowserWebGpu) without a display handle,
+/// then applies every instance-level wgpu environment variable (`InstanceDescriptor::with_env`),
+/// so `WGPU_BACKEND` (including `WGPU_BACKEND=gl`) overrides the backend set for the process.
+///
+/// Excluding `GL` from the default descriptor prevents Windows from initializing WGL and spawning
+/// the unused `"wgpu-hal WGL Instance Thread"` + hidden window on Vulkan/DX12 machines; machines
+/// whose only usable adapter is OpenGL still fall back to `wgpu::Backends::GL` automatically inside
+/// [`shared_device`] and [`compute_device`] when `WGPU_BACKEND` is unset.
 #[cfg(feature = "wgpu")]
 pub fn shared_instance_descriptor() -> wgpu::InstanceDescriptor {
-    wgpu::InstanceDescriptor::new_without_display_handle_from_env()
+    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+    desc.backends = wgpu::Backends::PRIMARY;
+    desc.with_env()
 }
 
 /// Borrow the process-wide shared GPU context, negotiating it EXACTLY ONCE.
@@ -530,15 +580,19 @@ pub fn shared_instance_descriptor() -> wgpu::InstanceDescriptor {
 /// no device is created in a module that could be unmapped under it.
 /// [`OnceLock::get_or_init`](std::sync::OnceLock::get_or_init) collapses concurrent first callers into ONE negotiation.
 ///
-/// **The instance honours wgpu's instance-level environment variables**
-/// ([`shared_instance_descriptor`]), read once, at the first call: `WGPU_BACKEND` (for example
-/// `dx12` or `vulkan`) selects the backends the shared device may come from for the whole process;
-/// the [`wgpu::InstanceFlags`] variables (`WGPU_DEBUG`, `WGPU_VALIDATION`,
-/// `WGPU_GPU_BASED_VALIDATION`, `WGPU_VALIDATION_INDIRECT_CALL`, `WGPU_DISCARD_HAL_LABELS`,
-/// `WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER`, `WGPU_STRICT_WEBGPU_COMPLIANCE`) and the backend
-/// options (`WGPU_DX12_COMPILER`, `WGPU_DX12_*`, `WGPU_GLES_MINOR_VERSION`, `WGPU_GL_*`,
-/// `WGPU_NOOP_BACKEND`) apply too. Unset variables change nothing. The adapter choice stays
-/// high-performance, non-fallback: `WGPU_POWER_PREF` and `WGPU_ADAPTER_NAME` are not read.
+/// **The instance prefers [`wgpu::Backends::PRIMARY`] and honours wgpu's instance-level
+/// environment variables** ([`shared_instance_descriptor`]), read once, at the first call:
+/// without `WGPU_BACKEND`, `shared_device()` probes `PRIMARY` (Vulkan | DX12 | Metal | WebGPU)
+/// first so Windows never spawns the unused `"wgpu-hal WGL Instance Thread"` and its hidden
+/// window, falling back to `Backends::GL` only if no PRIMARY adapter is available. Setting
+/// `WGPU_BACKEND` (for example `dx12`, `vulkan`, or `gl`) selects the exact backend set for the
+/// whole process with no silent fallback; the [`wgpu::InstanceFlags`] variables (`WGPU_DEBUG`,
+/// `WGPU_VALIDATION`, `WGPU_GPU_BASED_VALIDATION`, `WGPU_VALIDATION_INDIRECT_CALL`,
+/// `WGPU_DISCARD_HAL_LABELS`, `WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER`,
+/// `WGPU_STRICT_WEBGPU_COMPLIANCE`) and the backend options (`WGPU_DX12_COMPILER`, `WGPU_DX12_*`,
+/// `WGPU_GLES_MINOR_VERSION`, `WGPU_GL_*`, `WGPU_NOOP_BACKEND`) apply too. Unset variables change
+/// nothing. The adapter choice stays high-performance, non-fallback: `WGPU_POWER_PREF` and
+/// `WGPU_ADAPTER_NAME` are not read.
 #[cfg(feature = "wgpu")]
 pub fn shared_device() -> Option<&'static SharedGpu> {
     SHARED
@@ -550,15 +604,7 @@ pub fn shared_device() -> Option<&'static SharedGpu> {
                 );
                 return None;
             }
-            // TODO(gl-backend): the default backends include GL. On Windows its WGL instance
-            // spawns a thread ("wgpu-hal WGL Instance Thread") that owns a hidden window and parks
-            // for the instance's lifetime, although the shared device is Vulkan/DX12/Metal. It was
-            // the thread that crashed in an unloaded OpenFX plug-in (now prevented by the pin
-            // above). Dropping GL from this instance (Backends::PRIMARY) would remove the thread and
-            // speed up negotiation, but changes which adapters `query`-style consumers of the same
-            // instance can see; a separate decision (CHANGELOG, Unreleased, Known issues).
-            let instance = wgpu::Instance::new(shared_instance_descriptor());
-            let adapter = high_performance_adapter(&instance)?;
+            let (instance, adapter) = open_shared_instance_and_adapter().ok()?;
             let _creating = DEVICE_CREATION
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -652,14 +698,7 @@ pub fn compute_device_status() -> Result<&'static ComputeGpu, &'static str> {
                 log::error!("gpu-info: no compute device: {reason}");
                 reason
             })?;
-            let instance = wgpu::Instance::new(shared_instance_descriptor());
-            let adapter =
-                pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::HighPerformance,
-                    force_fallback_adapter: false,
-                    compatible_surface: None,
-                    apply_limit_buckets: false,
-                }))
+            let (instance, adapter) = open_shared_instance_and_adapter()
                 .map_err(|error| format!("no high-performance compute adapter: {error}"))?;
             let _creating = DEVICE_CREATION
                 .lock()
@@ -911,18 +950,40 @@ mod tests {
         );
     }
 
-    /// Without `WGPU_BACKEND` the shared instance keeps wgpu's default backend set. A process
-    /// that sets the variable cannot check that: the test says so and checks nothing.
+    /// Without `WGPU_BACKEND` the shared instance starts with `Backends::PRIMARY` (excluding GL so
+    /// Windows never spawns the unused WGL instance thread). A process that sets `WGPU_BACKEND`
+    /// cannot check the unset default: the test says so and skips.
     #[test]
-    fn shared_instance_descriptor_without_env_keeps_the_default_backends() {
+    fn shared_instance_descriptor_without_env_uses_primary_backends() {
         if let Some(value) = std::env::var_os("WGPU_BACKEND") {
             println!("SKIPPED: WGPU_BACKEND={value:?} is set in this test process");
             return;
         }
-        assert_eq!(
-            shared_instance_descriptor().backends,
-            wgpu::InstanceDescriptor::new_without_display_handle().backends
+        let backends = shared_instance_descriptor().backends;
+        assert_eq!(backends, wgpu::Backends::PRIMARY);
+        assert!(
+            !backends.contains(wgpu::Backends::GL),
+            "default shared instance descriptor must exclude GL so Windows does not spawn a WGL thread"
         );
+    }
+
+    /// GL fallback runs only when `WGPU_BACKEND` was unset: an explicit backend selection must
+    /// never silently downgrade to OpenGL.
+    #[test]
+    fn gl_fallback_policy_respects_explicit_env_override() {
+        assert!(should_fallback_to_gl(None));
+        for explicit in [
+            wgpu::Backends::VULKAN,
+            wgpu::Backends::DX12,
+            wgpu::Backends::METAL,
+            wgpu::Backends::GL,
+            wgpu::Backends::PRIMARY,
+        ] {
+            assert!(
+                !should_fallback_to_gl(Some(explicit)),
+                "explicit WGPU_BACKEND ({explicit:?}) must not fall back to GL"
+            );
+        }
     }
 
     /// GPU-free OnceLock idempotency: repeated calls yield the same cached state (both `Some`

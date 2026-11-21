@@ -9,9 +9,11 @@
 //! Pass criteria (every one is a measured property, not a timing):
 //! - the fixture image stays mapped after `FreeLibrary` (the shared device pinned it), so every
 //!   load reuses the same image and the negotiation happens once;
-//! - exactly ONE live thread starts inside the image in every cycle (wgpu's GL-backend instance
-//!   thread, running code that stays mapped). Without the pin this count grows by one per cycle,
-//!   and each such thread executes unmapped code when it next wakes: the access violation;
+//! - the number of live threads starting inside the image stays constant and at most `1` across
+//!   every cycle (`0` on `Backends::PRIMARY` where the WGL instance thread is no longer spawned;
+//!   `1` if `WGPU_BACKEND=gl` or GL-only fallback is active, running code that stays mapped).
+//!   Without the pin this count grows by one per cycle when GL is enabled, and each such thread
+//!   executes unmapped code when it next wakes: the access violation;
 //! - private memory and the handle count stay flat from cycle 1 to the last cycle (without the pin
 //!   each cycle leaked a whole device, measured at about 230 MB and 57 handles).
 #[cfg(windows)]
@@ -236,6 +238,7 @@ mod probe {
             cycles.push(cycle);
         }
         let mut pass = true;
+        let expected_threads = cycles.first().map_or(0, |c| c.threads_in_image);
         for (index, cycle) in cycles.iter().enumerate() {
             if !cycle.still_mapped {
                 println!(
@@ -244,9 +247,9 @@ mod probe {
                 );
                 pass = false;
             }
-            if cycle.threads_in_image != 1 {
+            if cycle.threads_in_image > 1 || cycle.threads_in_image != expected_threads {
                 println!(
-                    "FAIL cycle {}: {} live threads start inside the image (expected 1)",
+                    "FAIL cycle {}: {} live threads start inside the image (expected constant {expected_threads}, <= 1)",
                     index + 1,
                     cycle.threads_in_image
                 );
