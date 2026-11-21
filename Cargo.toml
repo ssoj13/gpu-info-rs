@@ -1,6 +1,6 @@
 [package]
 name = "gpu-info-rs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Portable GPU info: wgpu capability reporting (limits/features/formats) + DXGI VRAM budget, plus OS-level VRAM/RAM query (no GPU context). One-stop GPU info crate with a diagnostic CLI."
 authors = ["Alex Khalyavin <joss13@gmail.com>"]
